@@ -780,11 +780,11 @@ dispatch_impl(
          *
          *   Send Buffer (紧随 recv buffer):
          *   ┌─────────────────────────────────────────────────────────────┐
-         *   │                    Send Buffer                             │
-         *   │  ┌─────────────────────────────────────────────────────┐   │
-         *   │  │  [kNumMaxTokensPerRank tokens]                       │   │
-         *   │  │  用于存储本 warp 发出的 token (可能被 RDMA 读取)     │   │
-         *   │  └─────────────────────────────────────────────────────┘   │
+         *   │                    Send Buffer                              │
+         *   │  ┌─────────────────────────────────────────────────────┐    │
+         *   │  │  [kNumMaxTokensPerRank tokens]                      │    │
+         *   │  │  用于存储本 warp 发出的 token (可能被 RDMA 读取)      │    │
+         *   │  └─────────────────────────────────────────────────────┘    │ 
          *   └─────────────────────────────────────────────────────────────┘
          *
          *   TMA Buffer (SMEM, 每个 dispatch warp 独立):
@@ -797,15 +797,30 @@ dispatch_impl(
          *   └─────────────────────────────────────────────────────────────┘
          */
         // Token layout: hidden + SF + topk
-        const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
+        const auto token_layout = layout::TokenLayout(
+            kNumHiddenBytes,                     // hidden 字节数
+            kNumSFPacks * sizeof(sf_pack_t),     // scale factor 字节数
+            kNumTopk,                            // top-k 数量
+            true                                 // with_metadata=true, 包含 src_token_global_idx 等
+        );
 
         // TMA buffer: 指向 shared memory
-        const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumDispatchWarps, 1,
-            math::advance_ptr<int>(smem, kNumSmemBytesForNotify)).get_rank_buffer(dispatch_warp_idx).get_token_buffer(0);
+        const auto tma_buffer = layout::BufferLayout<true>( //kWithMBarrier=true → 每个 token 末尾带 mbarrier（TMA 多播同步用）。
+            token_layout,          // 用上面的 token 布局
+            kNumDispatchWarps,     // num_ranks = dispatch warp 数量
+            1,                     // 每个 "rank" 只放 1 个 token
+            smem + kNumSmemBytesForNotify  // base = smem 跳过通知区
+        ).get_rank_buffer(dispatch_warp_idx)  // 取当前 warp 对应的 rank slice
+        .get_token_buffer(0);                // 取第 0 个 token 的 TokenLayout
+
 
         // Recv buffer 和 Send buffer
+        // recv_buffer（创建时）：整个 recv buffer 区域，包含所有 rank 的 token 槽位
         auto recv_buffer = layout::BufferLayout<false>(token_layout, kNumRanks, kNumMaxTokensPerRank, buffer);
+        //send_buffer：紧跟 recv buffer 之后，只有 1 个 "rank"（本 rank），放 kNumMaxTokensPerRank 个 token
         auto send_buffer = layout::BufferLayout<false>(token_layout, 1, kNumMaxTokensPerRank, recv_buffer.get_buffer_end_ptr());
+        //将 recv_buffer 缩窄到只看本 rank 对应的分区
+        //此时 recv_buffer 和 send_buffer 的 num_ranks 都是 1，结构对称，方便后续统一用 get_token_buffer(idx) 访问。
         recv_buffer = recv_buffer.get_rank_buffer(rank_idx);
 
         /**
@@ -830,8 +845,10 @@ dispatch_impl(
          *   每个 dispatch warp 处理一组 tokens,跨所有 SM 交错
          *
          *   示例: kNumDispatchWarps=2, kNumSMs=4
-         *   - warp 0: token 0, 8, 16, 24, ...  (dispatch_warp_idx=0)
-         *   - warp 1: token 1, 9, 17, 25, ...  (dispatch_warp_idx=1)
+         *   - warp 0, SM 0: token 0, 8, 16, 24, ...
+         *   - warp 0, SM 1: token 1, 9, 17, 25, ...
+         *   - warp 1, SM 0: token 4, 12, 20, 28, ...
+         *   - warp 1, SM 1: token 5, 13, 21, 29, ...
          *
          *   这样的交错设计确保:
          *   1. 负载均衡 (所有 SM 处理不同 warp 的 token)
