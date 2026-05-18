@@ -1,0 +1,1451 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vLLM Async SP — Symmetric Memory 深度解析</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card-bg: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #7ee787;
+    --accent3: #f0883e;
+    --accent4: #d2a8ff;
+    --accent5: #ff7b72;
+    --code-bg: #1c2129;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+
+  h1 {
+    font-size: 2.4em;
+    text-align: center;
+    margin-bottom: 8px;
+    background: linear-gradient(135deg, #58a6ff, #d2a8ff, #f0883e);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 1.1em;
+    margin-bottom: 48px;
+  }
+
+  h2 {
+    font-size: 1.6em;
+    margin-top: 48px;
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--border);
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 1.25em;
+    margin-top: 32px;
+    margin-bottom: 12px;
+    color: var(--accent2);
+  }
+  h4 {
+    font-size: 1.1em;
+    margin-top: 20px;
+    margin-bottom: 8px;
+    color: var(--accent4);
+  }
+  p { margin-bottom: 14px; }
+
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin: 20px 0;
+  }
+  .card-glow {
+    box-shadow: 0 0 30px rgba(88,166,255,0.08);
+  }
+
+  code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-family: 'SF Mono', 'Cascadia Code', Consolas, monospace;
+    font-size: 0.9em;
+    color: var(--accent4);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    overflow-x: auto;
+    margin: 16px 0;
+    font-family: 'SF Mono', 'Cascadia Code', Consolas, monospace;
+    font-size: 0.88em;
+    line-height: 1.6;
+  }
+  pre .comment { color: #6a737d; }
+  pre .keyword { color: #ff7b72; }
+  pre .func { color: #d2a8ff; }
+  pre .string { color: #a5d6ff; }
+  pre .type { color: #7ee787; }
+  pre .number { color: #f0883e; }
+  pre .op { color: #79c0ff; }
+
+  .highlight-box {
+    border-left: 4px solid var(--accent);
+    background: rgba(88,166,255,0.06);
+    padding: 16px 20px;
+    border-radius: 0 8px 8px 0;
+    margin: 16px 0;
+  }
+  .warn-box {
+    border-left: 4px solid var(--accent3);
+    background: rgba(240,136,62,0.06);
+    padding: 16px 20px;
+    border-radius: 0 8px 8px 0;
+    margin: 16px 0;
+  }
+
+  /* ====== Timeline / Pipeline SVG styles ====== */
+  .pipeline-container {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin: 20px 0;
+    overflow-x: auto;
+  }
+  .pipeline-title {
+    font-weight: 700;
+    font-size: 1.1em;
+    margin-bottom: 16px;
+    color: var(--accent);
+  }
+
+  /* ====== Architecture Diagram ====== */
+  .arch-diagram {
+    display: grid;
+    grid-template-columns: 1fr 60px 1fr;
+    gap: 0;
+    align-items: center;
+    margin: 24px 0;
+  }
+  .arch-box {
+    background: var(--card-bg);
+    border: 2px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+  }
+  .arch-box.pytorch { border-color: var(--accent); }
+  .arch-box.nccl { border-color: var(--accent3); }
+  .arch-box h4 { margin-top: 0; }
+  .arch-box.pytorch h4 { color: var(--accent); }
+  .arch-box.nccl h4 { color: var(--accent3); }
+  .arch-box ul { text-align: left; font-size: 0.92em; padding-left: 20px; }
+  .arch-arrow {
+    font-size: 2em;
+    text-align: center;
+    color: var(--text-muted);
+  }
+
+  /* ====== Comparison Table ====== */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 0.95em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 10px 14px;
+    text-align: left;
+  }
+  th {
+    background: rgba(88,166,255,0.1);
+    font-weight: 600;
+    color: var(--accent);
+  }
+  td { background: var(--card-bg); }
+
+  /* ====== Flow animation ====== */
+  @keyframes slideRight {
+    from { transform: translateX(-10px); opacity: 0.3; }
+    to { transform: translateX(10px); opacity: 1; }
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.7; }
+    50% { opacity: 1; }
+  }
+  .anim-arrow {
+    animation: slideRight 1.5s ease-in-out infinite alternate;
+  }
+  .pulse { animation: pulse 2s ease-in-out infinite; }
+
+  /* ====== Step diagram ====== */
+  .step-flow {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 16px 0;
+  }
+  .step-box {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 0.9em;
+    white-space: nowrap;
+  }
+  .step-box.comm { border-color: var(--accent); color: var(--accent); }
+  .step-box.comp { border-color: var(--accent2); color: var(--accent2); }
+  .step-box.sync { border-color: var(--accent3); color: var(--accent3); }
+  .step-arrow { color: var(--text-muted); font-size: 1.2em; }
+
+  /* ====== Tag ====== */
+  .tag {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.82em;
+    font-weight: 600;
+    margin-right: 6px;
+  }
+  .tag-pytorch { background: rgba(88,166,255,0.15); color: var(--accent); border: 1px solid var(--accent); }
+  .tag-nccl { background: rgba(240,136,62,0.15); color: var(--accent3); border: 1px solid var(--accent3); }
+  .tag-env { background: rgba(126,231,135,0.15); color: var(--accent2); border: 1px solid var(--accent2); }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>vLLM Async SP — Symmetric Memory 深度解析</h1>
+<p class="subtitle">第三层运行时：PyTorch Symmetric Memory 如何实现通信与计算的流水线重叠</p>
+
+<!-- ================================================================== -->
+<h2>1. 什么是 Symmetric Memory（对称内存）？</h2>
+
+<div class="card card-glow">
+<p>
+想象你有一个 8 GPU 的节点。通常每个 GPU 只能访问自己的显存——如果想读别人的数据，得先"发消息"让对方拷贝过来。
+</p>
+<p>
+<strong>Symmetric Memory</strong>打破了这堵墙：所有 GPU 在各自的显存中分配一块<strong>相同虚拟地址</strong>的缓冲区，然后通过 NVLink 的 <strong>multicast（多播）</strong>能力，让任何一个 GPU 都能直接读写其他 GPU 上的对应位置。
+</p>
+
+<div class="highlight-box">
+<strong>一句话概括：</strong>所有 rank 的 buffer 拥有相同的虚拟地址，且互相知道彼此的物理位置，使得 GPU 可以直接发起远程读/写/multicast 操作，无需 CPU 介入。
+</div>
+</div>
+
+<!-- ================================================================== -->
+<h2>2. 两套对称内存路径详解</h2>
+
+<p>这就是你问的核心问题。vLLM 中确实有<strong>两条完全不同的对称内存路径</strong>，它们使用不同的底层机制，服务于不同的场景：</p>
+
+<div class="arch-diagram">
+  <div class="arch-box pytorch">
+    <h4><span class="tag tag-pytorch">路径 A</span> PyTorch Symmetric Memory</h4>
+    <p style="font-size:0.88em; color: var(--text-muted);">torch.distributed._symmetric_memory</p>
+    <ul>
+      <li>由 <strong>PyTorch</strong> 原生提供</li>
+      <li>核心能力：<strong>融合算子</strong>的流水线重叠</li>
+      <li>用于 <code>fused_all_gather_matmul</code>（聚合+GEMM，输入侧）</li>
+      <li>用于 <code>fused_matmul_reduce_scatter</code>（GEMM+散播，输出侧）</li>
+      <li>用于 <code>fused_all_gather_scaled_matmul</code> / <code>fused_scaled_matmul_reduce_scatter</code>（FP8 变体）</li>
+      <li>用于 <code>multimem_all_reduce_</code> / <code>two_shot_all_reduce_</code></li>
+      <li>通信+计算在<strong>同一个算子内部</strong>按 chunk 流水线执行</li>
+    </ul>
+  </div>
+  <div class="arch-arrow">
+    <div style="font-size:0.7em; color:var(--text-muted); text-align:center; line-height:1.4;">
+      不同的<br>分配器<br>&&<br>不同的<br>通信原语
+    </div>
+  </div>
+  <div class="arch-box nccl">
+    <h4><span class="tag tag-nccl">路径 B</span> NCCL Symmetric Memory</h4>
+    <p style="font-size:0.88em; color: var(--text-muted);">ncclMemAlloc / pynccl_allocator</p>
+    <ul>
+      <li>由 <strong>NCCL</strong> 库提供</li>
+      <li>核心能力：<strong>NCCL 通信</strong>的对称内存加速</li>
+      <li>用 <code>ncclMemAlloc</code> 替代 <code>cudaMalloc</code></li>
+      <li>分配的内存可被 NCCL <strong>零拷贝直接访问</strong></li>
+      <li>用于 <code>all_reduce_symmetric_with_copy</code></li>
+      <li>不需要修改通信逻辑，只需换分配器</li>
+    </ul>
+  </div>
+</div>
+
+<h3>2.1 路径 A：PyTorch Symmetric Memory</h3>
+
+<div class="card">
+<h4>初始化流程</h4>
+<pre>
+<span class="comment"># 文件: vllm/distributed/device_communicators/symm_mem.py</span>
+<span class="keyword">import</span> torch.distributed._symmetric_memory <span class="keyword">as</span> torch_symm_mem
+
+<span class="keyword">class</span> <span class="type">SymmMemCommunicator</span>:
+    <span class="keyword">def</span> <span class="func">__init__</span>(self, group, device, ...):
+        <span class="comment"># ① 分配对称内存缓冲区 — 所有 rank 相同虚拟地址</span>
+        self.buffer = torch_symm_mem.<span class="func">empty</span>(
+            self.max_size // self.dtype.itemsize,
+            device=self.device, dtype=torch.bfloat16
+        )
+
+        <span class="comment"># ② 所有 rank 同步，交换地址信息，建立跨 rank 互访</span>
+        handle = torch_symm_mem.<span class="func">rendezvous</span>(
+            self.buffer, self.group.group_name
+        )
+
+        <span class="comment"># ③ 确认硬件支持 NVLink multicast</span>
+        <span class="keyword">assert</span> handle.multicast_ptr != <span class="number">0</span>
+</pre>
+
+<div class="highlight-box">
+<strong>关键步骤解读：</strong>
+<ol style="margin-top:8px; padding-left:20px;">
+  <li><code>torch_symm_mem.empty()</code> — 在每个 GPU 上分配一块 buffer，PyTorch 保证所有 rank 的 buffer 虚拟地址相同</li>
+  <li><code>rendezvous()</code> — 这是一个集合通信（collective），所有 rank 互相交换 buffer 的物理地址，然后注册到 NVLink 的 multicast 映射表</li>
+  <li><code>multicast_ptr != 0</code> — multicast 是 NVLink 的一种硬件能力，允许一个写操作同时更新所有 GPU 的对应地址。如果返回 0 说明硬件不支持</li>
+</ol>
+</div>
+</div>
+
+<div class="card">
+<h4>All-Reduce 的两种算法</h4>
+<pre>
+<span class="keyword">def</span> <span class="func">all_reduce</span>(self, inp, *, out=<span class="keyword">None</span>):
+    <span class="comment"># 1. 将输入拷贝到对称内存 buffer</span>
+    self.buffer[:inp.numel()].<span class="func">copy_</span>(inp.view(-<span class="number">1</span>))
+
+    <span class="keyword">if</span> use_multimem:
+        <span class="comment"># 算法一：NVLink Multicast 一步 All-Reduce</span>
+        <span class="comment">#   每个 rank 向自己的 buffer 写入本地数据，</span>
+        <span class="comment">#   然后通过 multicast 一次操作完成 reduce+broadcast</span>
+        torch.ops.symm_mem.<span class="func">multimem_all_reduce_</span>(
+            self.buffer[:inp.numel()], <span class="string">"sum"</span>, self.group.group_name
+        )
+    <span class="keyword">else</span>:
+        <span class="comment"># 算法二：两步 Reduce + Broadcast</span>
+        <span class="comment">#   Step 1: reduce-scatter（每个 rank 负责一部分求和）</span>
+        <span class="comment">#   Step 2: all-gather（每个 rank 广播自己算好的部分）</span>
+        torch.ops.symm_mem.<span class="func">two_shot_all_reduce_</span>(
+            self.buffer[:inp.numel()], <span class="string">"sum"</span>, self.group.group_name
+        )
+
+    <span class="comment"># 2. 从对称内存 buffer 拷贝结果到输出</span>
+    out.<span class="func">copy_</span>(self.buffer[:inp.numel()].view(out.shape))
+</pre>
+
+<div class="highlight-box">
+<strong>何时用哪种算法？</strong>
+<ul style="margin-top:8px; padding-left:20px;">
+  <li><code>multimem_all_reduce_</code> — world_size ∈ {4,6,8} (SM90) 或 {6,8} (SM100) 时使用，利用 NVLink multicast 硬件，一步到位</li>
+  <li><code>two_shot_all_reduce_</code> — world_size 较小（如 2）时使用，两步完成</li>
+</ul>
+</div>
+</div>
+
+<h3>2.2 路径 B：NCCL Symmetric Memory</h3>
+
+<div class="card">
+<p>
+这条路径的思想完全不同——它不创建新的通信原语，而是<strong>给 NCCL 换一个内存分配器</strong>。
+</p>
+
+<h4>原理</h4>
+<p>
+NCCL 通信时，数据通常需要先从 PyTorch 的 <code>cudaMalloc</code> 分配的内存拷贝到 NCCL 内部缓冲区，才能发起通信。<code>ncclMemAlloc</code> 分配的内存天然可被 NCCL 直接访问，省去这一步拷贝。
+</p>
+
+<pre>
+<span class="comment"># 文件: vllm/distributed/device_communicators/pynccl_allocator.py</span>
+
+<span class="comment"># 编译一个 C++ 插件，封装 ncclMemAlloc / ncclMemFree</span>
+nccl_allocator_source = <span class="string">"""
+#include &lt;nccl.h&gt;
+extern "C" {
+  void* nccl_alloc_plug(size_t size, int device, void* stream) {
+    void* ptr;
+    ncclResult_t err = ncclMemAlloc(&amp;ptr, size);  // 关键！
+    return ptr;
+  }
+  void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
+    ncclResult_t err = ncclMemFree(ptr);
+  }
+}
+"""</span>
+
+<span class="comment"># 将其注册为 PyTorch 的 CUDA 内存分配器</span>
+_allocator_wrapper = CUDAPluggableAllocator(
+    f<span class="string">"{out_dir}/{nccl_allocator_libname}.so"</span>,
+    <span class="string">"nccl_alloc_plug"</span>,
+    <span class="string">"nccl_free_plug"</span>,
+)
+_mem_pool = torch.cuda.MemPool(_allocator)
+</pre>
+
+<h4>使用方式</h4>
+<pre>
+<span class="comment"># 在 all_reduce 时，临时切换到 NCCL 对称内存池</span>
+<span class="keyword">class</span> <span class="type">nccl_symm_mem_context</span>:
+    <span class="keyword">def</span> <span class="func">__enter__</span>(self):
+        <span class="comment"># 切换当前线程的内存分配器到 NCCL mem pool</span>
+        self._mem_pool_ctx = torch.cuda.<span class="func">use_mem_pool</span>(get_nccl_mem_pool())
+        self._mem_pool_ctx.<span class="func">__enter__</span>()
+        <span class="keyword">return</span> self
+
+    <span class="keyword">def</span> <span class="func">__exit__</span>(self, ...):
+        self._mem_pool_ctx.<span class="func">__exit__</span>(...)
+        <span class="comment"># 把池中分配的内存段注册到 NCCL 通信窗口</span>
+        <span class="keyword">for</span> segment <span class="keyword">in</span> _cached_pool_snapshot:
+            self.pynccl_comm.<span class="func">register_comm_window_raw</span>(
+                segment[<span class="string">"address"</span>], segment[<span class="string">"total_size"</span>]
+            )
+</pre>
+</div>
+
+<h3>2.3 两条路径的核心区别</h3>
+
+<table>
+<tr>
+  <th></th>
+  <th><span class="tag tag-pytorch">路径 A</span> PyTorch SymmMem</th>
+  <th><span class="tag tag-nccl">路径 B</span> NCCL SymmMem</th>
+</tr>
+<tr>
+  <td><strong>分配器</strong></td>
+  <td><code>torch.distributed._symmetric_memory.empty()</code></td>
+  <td><code>ncclMemAlloc()</code> via CUDAPluggableAllocator</td>
+</tr>
+<tr>
+  <td><strong>通信原语</strong></td>
+  <td>PyTorch 自定义 kernel（multimem/two_shot）</td>
+  <td>NCCL 原生 all_reduce</td>
+</tr>
+<tr>
+  <td><strong>重叠方式</strong></td>
+  <td><strong>融合算子内部分块流水线</strong>（通信+计算在同一个 op 中）</td>
+  <td><strong>零拷贝</strong>（省去 copy-in/copy-out，但仍需等 NCCL 完成）</td>
+</tr>
+<tr>
+  <td><strong>适用场景</strong></td>
+  <td>Async TP 的融合 GEMM+通信</td>
+  <td>普通 all_reduce 的加速（特别是大张量）</td>
+</tr>
+<tr>
+  <td><strong>是否需要图优化</strong></td>
+  <td>是 — 需要 AsyncTPPass 重写计算图</td>
+  <td>否 — 透明替换分配器即可</td>
+</tr>
+<tr>
+  <td><strong>环境变量</strong></td>
+  <td><span class="tag tag-env">VLLM_ALLREDUCE_USE_SYMM_MEM=1</span></td>
+  <td><span class="tag tag-env">VLLM_USE_NCCL_SYMM_MEM=1</span></td>
+</tr>
+<tr>
+  <td><strong>默认状态</strong></td>
+  <td>默认开启</td>
+  <td>默认关闭</td>
+</tr>
+</table>
+
+<!-- ================================================================== -->
+<h2>3. 融合算子的流水线重叠 — 最精彩的部分</h2>
+
+<p>
+这是路径 A 的核心魔力。让我们深入看看 <code>fused_all_gather_matmul</code> 和 <code>fused_matmul_reduce_scatter</code> 是如何在 <strong>一个算子内部</strong> 实现通信与计算的流水线重叠的。
+</p>
+
+<h3>3.1 两种融合模式 — 一对对称的"阴阳"</h3>
+
+<div class="card card-glow" style="border: 2px solid var(--accent4);">
+<p>Async SP 有<strong>两个核心融合算子</strong>，它们在 Transformer 层中交替出现，形成完美的对称：</p>
+
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px;">
+  <div style="background:rgba(88,166,255,0.08); border:1px solid var(--accent); border-radius:10px; padding:16px;">
+    <h4 style="color:var(--accent); margin-top:0;">模式 A: AllGather + GEMM</h4>
+    <p style="font-size:0.92em;">通信先行，计算跟后</p>
+    <div class="step-flow" style="flex-wrap:wrap;">
+      <div class="step-box comm">AG chunk 0</div>
+      <div class="step-arrow">→</div>
+      <div class="step-box comp">GEMM chunk 0</div>
+    </div>
+    <p style="font-size:0.88em; color:var(--text-muted);">用途：QKV/MLP 的<strong>输入侧</strong></p>
+    <p style="font-size:0.88em; color:var(--text-muted);">算子：<code>fused_all_gather_matmul</code></p>
+    <p style="font-size:0.88em; color:var(--text-muted);">先聚合各 rank 分片 → 再对完整数据做 GEMM</p>
+  </div>
+  <div style="background:rgba(240,136,62,0.08); border:1px solid var(--accent3); border-radius:10px; padding:16px;">
+    <h4 style="color:var(--accent3); margin-top:0;">模式 B: GEMM + ReduceScatter</h4>
+    <p style="font-size:0.92em;">计算先行，通信跟后</p>
+    <div class="step-flow" style="flex-wrap:wrap;">
+      <div class="step-box comp">GEMM chunk 0</div>
+      <div class="step-arrow">→</div>
+      <div class="step-box sync">RS chunk 0</div>
+    </div>
+    <p style="font-size:0.88em; color:var(--text-muted);">用途：Attention/MLP 的<strong>输出侧</strong></p>
+    <p style="font-size:0.88em; color:var(--text-muted);">算子：<code>fused_matmul_reduce_scatter</code></p>
+    <p style="font-size:0.88em; color:var(--text-muted);">先做 GEMM → 再将结果分片散播到各 rank</p>
+  </div>
+</div>
+</div>
+
+<h3>3.2 为什么要融合？</h3>
+
+<div class="card">
+<p>
+<strong>不融合的情况（模式 A 为例）：</strong>
+</p>
+<div class="step-flow">
+  <div class="step-box comm">AllGather（等所有数据到齐）</div>
+  <div class="step-arrow">→</div>
+  <div class="step-box comp">GEMM（等通信完成再算）</div>
+</div>
+<p>通信和计算是<strong>串行</strong>的，总时间 = 通信时间 + 计算时间。浪费！</p>
+
+<p style="margin-top:16px;">
+<strong>融合后的情况（模式 A）：</strong>
+</p>
+<div class="step-flow">
+  <div class="step-box comm">AG chunk 0</div>
+  <div class="step-arrow">→</div>
+  <div class="step-box comp">GEMM chunk 0</div>
+  <div class="step-arrow">&</div>
+  <div class="step-box comm">AG chunk 1</div>
+  <div class="step-arrow">→</div>
+  <div class="step-box comp">GEMM chunk 1</div>
+  <div class="step-arrow">&</div>
+  <div class="step-box comm">AG chunk 2</div>
+  <div class="step-arrow">→</div>
+  <div class="step-box comp">GEMM chunk 2</div>
+  <div class="step-arrow">→</div>
+  <div class="step-box">...</div>
+</div>
+<p>通信和计算<strong>流水线重叠</strong>，总时间 ≈ max(通信, 计算) + 少量气泡。</p>
+
+<p style="margin-top:16px;">
+<strong>融合后的情况（模式 B）：</strong>
+</p>
+<div class="step-flow">
+  <div class="step-box comp">GEMM chunk 0</div>
+  <div class="step-arrow">→</div>
+  <div class="step-box sync">RS chunk 0</div>
+  <div class="step-arrow">&</div>
+  <div class="step-box comp">GEMM chunk 1</div>
+  <div class="step-arrow">→</div>
+  <div class="step-box sync">RS chunk 1</div>
+  <div class="step-arrow">&</div>
+  <div class="step-box comp">GEMM chunk 2</div>
+  <div class="step-arrow">→</div>
+  <div class="step-box sync">RS chunk 2</div>
+  <div class="step-arrow">→</div>
+  <div class="step-box">...</div>
+</div>
+<p>GEMM 算完一个 chunk 就立刻散播，同时继续算下一个 chunk。计算与通信同样<strong>流水线重叠</strong>。</p>
+</div>
+
+<h3>3.2 fused_all_gather_matmul 的时间线</h3>
+
+<div class="pipeline-container">
+<div class="pipeline-title">fused_all_gather_matmul — 4 GPU 流水线时间线</div>
+<svg width="100%" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background grid -->
+  <defs>
+    <pattern id="grid" width="200" height="70" patternUnits="userSpaceOnUse">
+      <path d="M 200 0 L 0 0 0 70" fill="none" stroke="#30363d" stroke-width="0.5"/>
+    </pattern>
+  </defs>
+  <rect width="900" height="280" fill="url(#grid)"/>
+
+  <!-- Time axis -->
+  <line x1="100" y1="250" x2="880" y2="250" stroke="#8b949e" stroke-width="1.5"/>
+  <polygon points="880,246 890,250 880,254" fill="#8b949e"/>
+  <text x="895" y="255" fill="#8b949e" font-size="12">时间</text>
+
+  <!-- Labels -->
+  <text x="50" y="40" fill="#58a6ff" font-size="13" font-weight="600">通信 (AG)</text>
+  <text x="50" y="130" fill="#7ee787" font-size="13" font-weight="600">计算 (GEMM)</text>
+  <text x="50" y="220" fill="#8b949e" font-size="13" font-weight="600">GPU 利用率</text>
+
+  <!-- AG chunks -->
+  <rect x="120" y="20" width="150" height="36" rx="6" fill="rgba(88,166,255,0.25)" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="145" y="44" fill="#58a6ff" font-size="12">AG chunk 0</text>
+
+  <rect x="280" y="20" width="150" height="36" rx="6" fill="rgba(88,166,255,0.25)" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="305" y="44" fill="#58a6ff" font-size="12">AG chunk 1</text>
+
+  <rect x="440" y="20" width="150" height="36" rx="6" fill="rgba(88,166,255,0.25)" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="465" y="44" fill="#58a6ff" font-size="12">AG chunk 2</text>
+
+  <rect x="600" y="20" width="150" height="36" rx="6" fill="rgba(88,166,255,0.25)" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="625" y="44" fill="#58a6ff" font-size="12">AG chunk 3</text>
+
+  <!-- GEMM chunks — shifted right, overlapping with next AG -->
+  <rect x="280" y="110" width="150" height="36" rx="6" fill="rgba(126,231,135,0.2)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="300" y="134" fill="#7ee787" font-size="12">GEMM chunk 0</text>
+
+  <rect x="440" y="110" width="150" height="36" rx="6" fill="rgba(126,231,135,0.2)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="460" y="134" fill="#7ee787" font-size="12">GEMM chunk 1</text>
+
+  <rect x="600" y="110" width="150" height="36" rx="6" fill="rgba(126,231,135,0.2)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="620" y="134" fill="#7ee787" font-size="12">GEMM chunk 2</text>
+
+  <rect x="760" y="110" width="120" height="36" rx="6" fill="rgba(126,231,135,0.2)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="780" y="134" fill="#7ee787" font-size="12">GEMM c3</text>
+
+  <!-- Overlap indicators -->
+  <rect x="280" y="190" width="470" height="24" rx="4" fill="rgba(210,168,255,0.15)" stroke="#d2a8ff" stroke-width="1" stroke-dasharray="4"/>
+  <text x="380" y="207" fill="#d2a8ff" font-size="11">← 通信与计算重叠区域 →</text>
+
+  <!-- Arrows showing data dependency -->
+  <line x1="195" y1="56" x2="280" y2="110" stroke="#8b949e" stroke-width="1" stroke-dasharray="3"/>
+  <line x1="355" y1="56" x2="440" y2="110" stroke="#8b949e" stroke-width="1" stroke-dasharray="3"/>
+  <line x1="515" y1="56" x2="600" y2="110" stroke="#8b949e" stroke-width="1" stroke-dasharray="3"/>
+  <line x1="675" y1="56" x2="760" y2="110" stroke="#8b949e" stroke-width="1" stroke-dasharray="3"/>
+
+  <!-- Bubble / idle -->
+  <rect x="120" y="110" width="150" height="36" rx="6" fill="rgba(139,148,158,0.1)" stroke="#8b949e" stroke-width="1" stroke-dasharray="4"/>
+  <text x="148" y="134" fill="#8b949e" font-size="11">等待数据</text>
+</svg>
+</div>
+
+<h3>3.3 fused_matmul_reduce_scatter 的时间线</h3>
+
+<div class="pipeline-container">
+<div class="pipeline-title">fused_matmul_reduce_scatter — 4 GPU 流水线时间线</div>
+<svg width="100%" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <rect width="900" height="280" fill="url(#grid)"/>
+
+  <!-- Time axis -->
+  <line x1="100" y1="250" x2="880" y2="250" stroke="#8b949e" stroke-width="1.5"/>
+  <polygon points="880,246 890,250 880,254" fill="#8b949e"/>
+  <text x="895" y="255" fill="#8b949e" font-size="12">时间</text>
+
+  <!-- Labels -->
+  <text x="50" y="40" fill="#7ee787" font-size="13" font-weight="600">计算 (GEMM)</text>
+  <text x="50" y="130" fill="#f0883e" font-size="13" font-weight="600">通信 (RS)</text>
+  <text x="50" y="220" fill="#8b949e" font-size="13" font-weight="600">GPU 利用率</text>
+
+  <!-- GEMM chunks (first) -->
+  <rect x="120" y="20" width="150" height="36" rx="6" fill="rgba(126,231,135,0.2)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="140" y="44" fill="#7ee787" font-size="12">GEMM chunk 0</text>
+
+  <rect x="280" y="20" width="150" height="36" rx="6" fill="rgba(126,231,135,0.2)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="300" y="44" fill="#7ee787" font-size="12">GEMM chunk 1</text>
+
+  <rect x="440" y="20" width="150" height="36" rx="6" fill="rgba(126,231,135,0.2)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="460" y="44" fill="#7ee787" font-size="12">GEMM chunk 2</text>
+
+  <rect x="600" y="20" width="150" height="36" rx="6" fill="rgba(126,231,135,0.2)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="620" y="44" fill="#7ee787" font-size="12">GEMM chunk 3</text>
+
+  <!-- RS chunks (after GEMM) -->
+  <rect x="280" y="110" width="150" height="36" rx="6" fill="rgba(240,136,62,0.2)" stroke="#f0883e" stroke-width="1.5"/>
+  <text x="300" y="134" fill="#f0883e" font-size="12">RS chunk 0</text>
+
+  <rect x="440" y="110" width="150" height="36" rx="6" fill="rgba(240,136,62,0.2)" stroke="#f0883e" stroke-width="1.5"/>
+  <text x="460" y="134" fill="#f0883e" font-size="12">RS chunk 1</text>
+
+  <rect x="600" y="110" width="150" height="36" rx="6" fill="rgba(240,136,62,0.2)" stroke="#f0883e" stroke-width="1.5"/>
+  <text x="620" y="134" fill="#f0883e" font-size="12">RS chunk 2</text>
+
+  <rect x="760" y="110" width="120" height="36" rx="6" fill="rgba(240,136,62,0.2)" stroke="#f0883e" stroke-width="1.5"/>
+  <text x="780" y="134" fill="#f0883e" font-size="12">RS c3</text>
+
+  <!-- Overlap indicators -->
+  <rect x="280" y="190" width="470" height="24" rx="4" fill="rgba(210,168,255,0.15)" stroke="#d2a8ff" stroke-width="1" stroke-dasharray="4"/>
+  <text x="380" y="207" fill="#d2a8ff" font-size="11">← 计算与通信重叠区域 →</text>
+
+  <!-- Arrows -->
+  <line x1="195" y1="56" x2="280" y2="110" stroke="#8b949e" stroke-width="1" stroke-dasharray="3"/>
+  <line x1="355" y1="56" x2="440" y2="110" stroke="#8b949e" stroke-width="1" stroke-dasharray="3"/>
+  <line x1="515" y1="56" x2="600" y2="110" stroke="#8b949e" stroke-width="1" stroke-dasharray="3"/>
+  <line x1="675" y1="56" x2="760" y2="110" stroke="#8b949e" stroke-width="1" stroke-dasharray="3"/>
+
+  <!-- Bubble -->
+  <rect x="120" y="110" width="150" height="36" rx="6" fill="rgba(139,148,158,0.1)" stroke="#8b949e" stroke-width="1" stroke-dasharray="4"/>
+  <text x="148" y="134" fill="#8b949e" font-size="11">等待计算</text>
+</svg>
+</div>
+
+<h3>3.5 流水线分块的工作原理 — 模式 A（真实源码）</h3>
+
+<div class="card card-glow">
+<p>
+下面是 PyTorch <code>torch.distributed._symmetric_memory</code> 中的<strong>真实源码</strong>，不是伪代码！
+</p>
+
+<h4 style="color:var(--accent);">3.5.1 核心流水线引擎 <code>_pipelined_multi_all_gather_and_consume</code></h4>
+<p>这是 <code>fused_all_gather_matmul</code> 的底层流水线实现。它的工作是：先让每个 rank 把自己的 shard 拷贝到对称内存，然后轮流从远程 rank 的 buffer 拉数据，每拉到一个 shard 就立刻执行 <code>shard_consumer</code>（即 GEMM）。</p>
+
+<pre>
+<span class="comment"># 文件: torch/distributed/_symmetric_memory/__init__.py</span>
+<span class="comment"># 核心函数: _pipelined_multi_all_gather_and_consume</span>
+
+<span class="keyword">def</span> <span class="func">_pipelined_multi_all_gather_and_consume</span>(
+    shard,              <span class="comment"># list[Tensor]: 本 rank 的输入 shard(s)</span>
+    shard_consumer,     <span class="comment"># Callable: 每收到一个远程 shard 就调用它（做 GEMM）</span>
+    ag_out,             <span class="comment"># list[Tensor]: all-gather 的完整输出（预分配）</span>
+    group_name,         <span class="comment"># 进程组名</span>
+    ag_out_needed=<span class="keyword">True</span>,
+):
+    <span class="comment"># ① 计算需要的 P2P buffer 大小，获取对称内存 workspace</span>
+    p2p_workspace_size_req = <span class="number">0</span>
+    <span class="keyword">for</span> x <span class="keyword">in</span> shard:
+        p2p_workspace_size_req += x.numel() * x.element_size()
+    symm_mem = <span class="func">get_symm_mem_workspace</span>(group_name, min_size=p2p_workspace_size_req)
+    group_size = symm_mem.world_size
+    rank = symm_mem.rank
+
+    <span class="comment"># ② 全局 barrier — 确保所有 rank 都就绪</span>
+    symm_mem.<span class="func">barrier</span>(channel=<span class="number">0</span>)
+    backend_stream = <span class="func">_get_backend_stream</span>()
+    backend_stream.<span class="func">wait_stream</span>(torch.cuda.current_stream())
+
+    <span class="comment"># ③ 获取指向本 rank 对称内存 buffer 的视图</span>
+    <span class="keyword">def</span> <span class="func">get_p2p_bufs</span>(remote_rank):
+        offset_bytes = <span class="number">0</span>
+        bufs = []
+        <span class="keyword">for</span> x <span class="keyword">in</span> shard:
+            buf = symm_mem.<span class="func">get_buffer</span>(     <span class="comment"># ← 核心！跨 rank 读取 buffer</span>
+                remote_rank,                <span class="comment">#   指定远程 rank</span>
+                x.shape,                    <span class="comment">#   形状</span>
+                x.dtype,                    <span class="comment">#   数据类型</span>
+                storage_offset=offset_bytes // x.element_size(),
+            )
+            bufs.append(buf)
+            offset_bytes += buf.numel() * buf.element_size()
+        <span class="keyword">return</span> bufs
+
+    local_p2p_bufs = get_p2p_bufs(rank)  <span class="comment"># 本 rank 的 buffer</span>
+
+    <span class="comment"># ④ 先把本地 shard 拷贝到本 rank 的对称内存 slot</span>
+    <span class="func">copy_shard</span>(dst=local_p2p_bufs, src=shard)
+    symm_mem.<span class="func">barrier</span>(channel=<span class="number">1</span>)  <span class="comment"># 等所有 rank 都完成拷贝</span>
+    backend_stream.<span class="func">wait_stream</span>(torch.cuda.current_stream())
+
+    <span class="comment"># ⑤ 先消费本地 shard（不需要跨 rank 传输）</span>
+    shard_consumer(shard, rank)
+
+    <span class="comment"># ⑥ ===== 流水线核心：轮流拉远程 shard 并消费 =====</span>
+    <span class="keyword">for</span> step <span class="keyword">in</span> <span class="func">range</span>(<span class="number">1</span>, group_size):
+        <span class="comment"># 双流交替：奇偶 step 用不同 CUDA stream，实现计算/通信重叠</span>
+        <span class="keyword">if</span> step % <span class="number">2</span> == <span class="number">0</span>:
+            stream = torch.cuda.current_stream()
+        <span class="keyword">else</span>:
+            stream = backend_stream
+
+        remote_rank = (step + rank) % group_size
+        remote_p2p_bufs = <span class="func">get_p2p_bufs</span>(remote_rank) <span class="comment"># 远程 rank 的 buffer</span>
+
+        <span class="keyword">with</span> stream:
+            <span class="comment"># ⑥a 从远程 rank 的对称内存 P2P 拷贝到本地</span>
+            <span class="comment">#    底层走 NVLink，不经过 CPU！</span>
+            <span class="func">copy_shard</span>(dst=shards[remote_rank], src=remote_p2p_bufs)
+
+            <span class="comment"># ⑥b 立刻对该 shard 执行 GEMM</span>
+            <span class="func">shard_consumer</span>(shards[remote_rank], remote_rank)
+
+    <span class="comment"># ⑦ 同步 &amp; 最终 barrier</span>
+    torch.cuda.current_stream().<span class="func">wait_stream</span>(backend_stream)
+    symm_mem.<span class="func">barrier</span>(channel=<span class="number">0</span>)
+</pre>
+
+<div class="highlight-box">
+<strong>关键 API 解读：</strong>
+<ul style="margin-top:6px; padding-left:20px;">
+  <li><code>symm_mem.get_buffer(remote_rank, shape, dtype)</code> — 返回一个 Tensor 视图，指向 <strong>remote_rank 的对称内存</strong>。底层通过 NVLink 直接访问远程 GPU 的显存，零拷贝！</li>
+  <li><code>copy_shard(dst, src)</code> — 底层是 <code>dst.copy_(src)</code>，当 src 是远程 buffer 时，CUDA 驱动自动走 NVLink P2P DMA 传输</li>
+  <li><code>symm_mem.barrier(channel)</code> — 基于 signal pad 的轻量级 barrier。不同 channel 独立，可以嵌套使用</li>
+  <li><strong>双流交替</strong>（step%2 切换 stream）— 让两个 CUDA stream 交替执行 "P2P copy + GEMM"，实现计算与通信的流水线重叠</li>
+</ul>
+</div>
+
+<h4 style="color:var(--accent); margin-top:20px;">3.5.2 GEMM 消费者：<code>shard_consumer</code> 回调</h4>
+<p>上面的流水线函数不直接做 GEMM，而是把 GEMM 逻辑抽象为 <code>shard_consumer</code> 回调。下面是 <code>fused_all_gather_matmul</code> 中的消费者实现：</p>
+
+<pre>
+<span class="comment"># 文件: torch/distributed/_symmetric_memory/__init__.py</span>
+<span class="comment"># _fused_all_gather_matmul_impl 中的 shard_consumer 定义</span>
+
+<span class="keyword">def</span> <span class="func">default_consumer</span>(shard, rank):
+    <span class="comment"># shard: 来自 rank 的 all-gather 分片</span>
+    <span class="comment"># rank: 该分片的源 rank</span>
+    <span class="keyword">for</span> idx, (B, kwargs) <span class="keyword">in</span> <span class="func">enumerate</span>(<span class="func">zip</span>(Bs, kwargs_list)):
+        <span class="comment"># 对该分片做 mm.out（就地写入预分配的输出 buffer）</span>
+        torch.ops.aten.mm.<span class="func">out</span>(shard, B, **kwargs, out=output_shards[idx][rank])
+
+<span class="comment"># 调用流水线引擎</span>
+_pipelined_all_gather_and_consume(
+    A_shard_flat,       <span class="comment"># 本 rank 的输入</span>
+    default_consumer,   <span class="comment"># ↑ 每到一个 chunk 就做一次 mm.out</span>
+    A_flat,             <span class="comment"># all-gather 输出 buffer</span>
+    group_name,
+    return_A,
+)
+</pre>
+
+<h4 style="color:var(--accent); margin-top:20px;">3.5.3 Native 异步 TP：<code>_async_input_mm</code> + Signal 机制</h4>
+<p>当 M 维度较小（2048 &lt; M ≤ 4096）时，PyTorch 还有一个更激进的路径：用 <strong>signal + async GEMM kernel</strong> 让 GEMM 自己等数据，完全不需要 host 端同步！</p>
+
+<pre>
+<span class="comment"># 文件: torch/distributed/_symmetric_memory/__init__.py</span>
+<span class="comment"># _fused_all_gather_matmul_native — 最激进的路径</span>
+
+<span class="keyword">def</span> <span class="func">_fused_all_gather_matmul_native</span>(A_shard, B, group_name):
+    symm_mem = <span class="func">rendezvous</span>(A_shard, group_name)
+    rank = symm_mem.rank
+    world_size = symm_mem.world_size
+
+    <span class="comment"># 预分配输出和 signal 数组</span>
+    A = A_shard.<span class="func">new_empty</span>(A_shard.shape[<span class="number">0</span>] * world_size, A_shard.shape[<span class="number">1</span>])
+    A_signals = torch.<span class="func">zeros</span>(world_size, dtype=torch.uint32, device=A_shard.device)
+    A_shards = A.<span class="func">chunk</span>(world_size)
+
+    <span class="comment"># ① 把本地 shard 拷贝到输出 buffer，并写 signal 通知 GEMM kernel</span>
+    A_shards[rank].<span class="func">copy_</span>(A_shard)
+    _SymmetricMemory.<span class="func">stream_write_value32</span>(A_signals, rank, <span class="number">1</span>)
+    <span class="comment">#   ↑ cuStreamWriteValue32: GPU 端原子写，在 write 之前</span>
+    <span class="comment">#     会发出 system-level fence，确保 copy_ 的数据对 GEMM 可见</span>
+
+    <span class="comment"># ② 启动异步 GEMM — 它会自己等 signal！</span>
+    out = torch.ops.symm_mem.<span class="func">_async_input_mm</span>(A, B, A_signals, rank)
+    <span class="comment">#   ↑ 这是一个自定义 CUDA kernel，内部逻辑：</span>
+    <span class="comment">#     while signals[chunk_id] == 0: spin_wait;</span>
+    <span class="comment">#     // data is ready, do GEMM on this chunk</span>
+    <span class="comment">#     chunk_id++;</span>
+
+    <span class="comment"># ③ 在后台流中，继续从远程 rank 拷贝数据并写 signal</span>
+    <span class="keyword">for</span> step <span class="keyword">in</span> <span class="func">range</span>(<span class="number">1</span>, world_size):
+        src_rank = (rank + step) % world_size
+        src_buf = symm_mem.<span class="func">get_buffer</span>(src_rank, A_shard.shape, A_shard.dtype)
+        <span class="keyword">with</span> backend_stream:
+            A_shards[src_rank].<span class="func">copy_</span>(src_buf)  <span class="comment"># P2P 拷贝</span>
+            _SymmetricMemory.<span class="func">stream_write_value32</span>(A_signals, src_rank, <span class="number">1</span>)
+            <span class="comment"># ↑ 写 signal → 告诉 _async_input_mm "这个 chunk 准备好了"</span>
+
+    <span class="comment"># ④ 最终同步</span>
+    current_stream.<span class="func">wait_stream</span>(backend_stream)
+    symm_mem.<span class="func">barrier</span>()
+    <span class="keyword">return</span> A, out
+</pre>
+
+<div class="warn-box">
+<strong>Signal 机制 vs Barrier：</strong>
+<ul style="margin-top:6px; padding-left:20px;">
+  <li><code>barrier(channel)</code> — 基于 signal pad 的跨 rank 同步，所有 rank 必须都到达才能继续</li>
+  <li><code>stream_write_value32 + _async_input_mm</code> — GPU 端细粒度通知。GEMM kernel 内部 spin-wait 等 signal，<strong>不需要 host 端介入</strong>，延迟更低</li>
+  <li>Signal 机制特别适合小 batch 场景，因为 barrier 的开销相对更显著</li>
+</ul>
+</div>
+
+<h4 style="color:var(--accent); margin-top:20px;">3.5.4 Multicast 快速路径</h4>
+<p>当硬件支持 NVLink multicast 且 M ≤ 2048 时，还有一条更快的路径：</p>
+
+<pre>
+<span class="comment"># 文件: torch/distributed/_symmetric_memory/__init__.py</span>
+<span class="comment"># _multimem_all_gather_matmul — 利用 multicast 硬件</span>
+
+<span class="keyword">def</span> <span class="func">_multimem_all_gather_matmul</span>(A_shard, Bs, group_name):
+    group = <span class="func">resolve_process_group</span>(group_name)
+    A_shape = (A_shard.shape[<span class="number">0</span>] * group.size(), *A_shard.shape[<span class="number">1</span>:])
+
+    <span class="comment"># 从对称内存 workspace 获取 buffer</span>
+    symm_mem = <span class="func">get_symm_mem_workspace</span>(group_name, A_shape.numel() * A_shard.element_size())
+    A = symm_mem.<span class="func">get_buffer</span>(symm_mem.rank, A_shape, A_shard.dtype)
+
+    <span class="comment"># 一步完成 all-gather！底层使用 NVLink multicast 硬件</span>
+    torch.ops.symm_mem.<span class="func">multimem_all_gather_out</span>(A_shard, group_name, A)
+
+    <span class="comment"># 对完整数据做 GEMM</span>
+    <span class="keyword">return</span> [torch.<span class="func">matmul</span>(A, B) <span class="keyword">for</span> B <span class="keyword">in</span> Bs]
+</pre>
+
+<div class="highlight-box">
+<strong>Multicast vs 流水线：</strong>Multicast 路径不做分块流水线，而是利用硬件一次完成 all-gather（一次写，所有 rank 都看到），然后再做 GEMM。当数据量小（M ≤ 2048）时，multicast 的延迟比分块流水线更低，因为少了多次 kernel launch 的开销。
+</div>
+</div>
+
+<h3>3.6 流水线分块的工作原理 — 模式 B（真实源码）</h3>
+
+<div class="card card-glow">
+<p>
+再看<strong>模式 B (GEMM + ReduceScatter)</strong>的真实源码。它使用 <code>_pipelined_produce_and_all2all</code> 流水线引擎，方向与模式 A 相反：先算 GEMM，再把结果通过 all-to-all 散播出去。
+</p>
+
+<h4 style="color:var(--accent3);">3.6.1 核心流水线引擎 <code>_pipelined_produce_and_all2all</code></h4>
+
+<pre>
+<span class="comment"># 文件: torch/distributed/_symmetric_memory/__init__.py</span>
+<span class="comment"># 核心函数: _pipelined_produce_and_all2all</span>
+
+<span class="keyword">def</span> <span class="func">_pipelined_produce_and_all2all</span>(
+    chunk_producer,     <span class="comment"># Callable[[dst_rank, out_tensor], None]: 生产一个 chunk</span>
+    output,             <span class="comment"># Tensor: all-to-all 输出（预分配）</span>
+    group_name,         <span class="comment"># 进程组名</span>
+    out_chunk_dim=<span class="number">0</span>,
+):
+    out_chunks = output.<span class="func">chunk</span>(group_size, dim=out_chunk_dim)
+    p2p_workspace_size_req = out_chunks[<span class="number">0</span>].numel() * out_chunks[<span class="number">0</span>].element_size() * <span class="number">2</span>
+    symm_mem = <span class="func">get_symm_mem_workspace</span>(group_name, min_size=p2p_workspace_size_req)
+    group_size = symm_mem.world_size
+    rank = symm_mem.rank
+
+    symm_mem.<span class="func">barrier</span>(channel=<span class="number">0</span>)
+    backend_stream = <span class="func">_get_backend_stream</span>()
+    backend_stream.<span class="func">wait_stream</span>(torch.cuda.current_stream())
+
+    <span class="comment"># 准备两个本地 P2P buffer，双缓冲！</span>
+    <span class="comment"># step [i] 的结果写入 buf_0 时，远程 rank 正在从 buf_1 拉数据</span>
+    local_p2p_buf_0 = <span class="func">get_p2p_buf</span>(rank, <span class="number">0</span>)
+    local_p2p_buf_1 = <span class="func">get_p2p_buf</span>(rank, <span class="number">1</span>)
+
+    <span class="comment"># ===== 流水线核心 =====</span>
+    <span class="keyword">for</span> step <span class="keyword">in</span> <span class="func">range</span>(<span class="number">1</span>, group_size):
+        remote_rank = (rank - step) % group_size
+        <span class="keyword">if</span> step % <span class="number">2</span> == <span class="number">0</span>:
+            stream = torch.cuda.current_stream()
+            p2p_buf, remote_p2p_buf = local_p2p_buf_1, <span class="func">get_p2p_buf</span>(remote_rank, <span class="number">1</span>)
+        <span class="keyword">else</span>:
+            stream = backend_stream
+            p2p_buf, remote_p2p_buf = local_p2p_buf_0, <span class="func">get_p2p_buf</span>(remote_rank, <span class="number">0</span>)
+
+        <span class="keyword">with</span> stream:
+            <span class="comment"># ① 执行 GEMM，结果直接写入本地 P2P buffer</span>
+            <span class="func">chunk_producer</span>((rank + step) % group_size, p2p_buf)
+
+            <span class="comment"># ② barrier: 确保所有 rank 都完成了这一步的计算</span>
+            symm_mem.<span class="func">barrier</span>(channel=step % <span class="number">2</span>)
+
+            <span class="comment"># ③ 从远程 rank 的 P2P buffer 拉数据到本地输出</span>
+            out_chunks[remote_rank].<span class="func">copy_</span>(remote_p2p_buf)
+
+            <span class="comment"># ④ 再次 barrier: 确保所有 rank 都读完了</span>
+            <span class="comment">#    （本 rank 的 P2P buffer 才能被下一步覆盖）</span>
+            symm_mem.<span class="func">barrier</span>(channel=step % <span class="number">2</span>)
+
+    <span class="comment"># ⑤ 处理本 rank 自己的 chunk</span>
+    <span class="func">chunk_producer</span>(rank, out_chunks[rank])
+
+    torch.cuda.current_stream().<span class="func">wait_stream</span>(backend_stream)
+    symm_mem.<span class="func">barrier</span>(channel=<span class="number">0</span>)
+</pre>
+
+<div class="highlight-box">
+<strong>模式 B 的关键设计：</strong>
+<ul style="margin-top:6px; padding-left:20px;">
+  <li><strong>双缓冲</strong>（buf_0 / buf_1）— 写 buf_0 的同时远程 rank 可以从 buf_1 读，避免读写冲突</li>
+  <li><strong>两次 barrier</strong> — 第一次等所有 rank 算完，第二次等所有 rank 读完。两次 barrier 之间就是 P2P 拷贝窗口</li>
+  <li><strong>计算→通信→计算→通信</strong>的流水线 — chunk_producer（GEMM）和 copy_（P2P 传输）交替执行</li>
+</ul>
+</div>
+
+<h4 style="color:var(--accent3); margin-top:20px;">3.6.2 GEMM 生产者：<code>chunk_producer</code> 回调</h4>
+
+<pre>
+<span class="comment"># 文件: torch/distributed/_symmetric_memory/__init__.py</span>
+<span class="comment"># _fused_matmul_reduce_scatter_impl 中的 chunk_producer 定义</span>
+
+<span class="comment"># scatter_dim != last_dim 的路径</span>
+<span class="keyword">def</span> <span class="func">chunk_producer</span>(rank, out):
+    <span class="comment"># A_shards[rank]: 输入 A 按 world_size 分的第 rank 个分片</span>
+    <span class="comment"># B: 权重矩阵</span>
+    <span class="comment"># out: 写入目标（本地 P2P buffer）</span>
+    torch.ops.aten.mm.<span class="func">out</span>(A_shards[rank], B, **kwargs, out=out)
+
+<span class="comment"># scatter_dim == last_dim 的路径（特殊优化）</span>
+<span class="keyword">def</span> <span class="func">_chunk_producer</span>(rank, out):
+    <span class="comment"># B 按输出维度分片，每个 rank 对应不同的 B_shard</span>
+    torch.ops.aten.mm.<span class="func">out</span>(A_flat, B_shards[rank], **kwargs, out=out)
+
+<span class="comment"># 调用流水线引擎</span>
+_pipelined_produce_and_all2all(
+    chunk_producer,
+    stacked_partials,   <span class="comment"># all-to-all 输出（未 reduce 的部分和）</span>
+    group_name,
+)
+<span class="comment"># 最后对 stacked_partials 做 reduce (sum/avg)</span>
+result = reduce_fn(stacked_partials.view(*leading_dims, -<span class="number">1</span>), dim=scatter_dim)
+</pre>
+
+<div class="warn-box">
+<strong>模式 A vs B 的微妙区别：</strong>
+<ul style="margin-top:6px; padding-left:20px;">
+  <li><strong>模式 A (AG+GEMM)</strong>：通信是"拉"模型 — 本地主动从远程读数据，到了就算</li>
+  <li><strong>模式 B (GEMM+RS)</strong>：通信是"推+拉"模型 — 本地算完写入 P2P buffer，远程来拉；本质是 all-to-all</li>
+  <li>模式 B 需要额外的 <strong>reduce 步骤</strong> — all-to-all 之后还要 sum/avg 各 rank 的部分和</li>
+  <li>两者在 Transformer 层中<strong>交替出现</strong>，形成"收→算→推→算→收→..."的循环</li>
+</ul>
+</div>
+</div>
+
+<h3>3.7 <code>_SymmetricMemory</code> 底层 C++ API 详解</h3>
+
+<div class="card card-glow" style="border: 2px solid var(--accent2);">
+<p>
+<code>_SymmetricMemory</code> 是 PyTorch C++ 层（<code>torch._C._distributed_c10d._SymmetricMemory</code>）暴露的对称内存句柄。上面流水线代码中所有 <code>symm_mem.xxx()</code> 调用最终都走向这些 C++ API。完整 API 列表：
+</p>
+
+<table>
+<tr><th>API</th><th>功能</th><th>底层实现</th></tr>
+<tr>
+  <td><code>empty_strided_p2p(size, stride, dtype, device, group_name)</code></td>
+  <td>分配对称内存 tensor</td>
+  <td>调用 <code>c10d::SymmetricMemory::emptyStridedP2P</code>，所有 rank 分配相同虚拟地址的 buffer</td>
+</tr>
+<tr>
+  <td><code>rendezvous(tensor, group_name)</code></td>
+  <td>建立跨 rank 互访</td>
+  <td>所有 rank 交换 buffer 的物理地址 + IPC handle，注册到 NVLink P2P 映射表</td>
+</tr>
+<tr>
+  <td><code>get_buffer(rank, shape, dtype, offset)</code></td>
+  <td>获取远程 rank 的 buffer 视图</td>
+  <td>返回指向 <strong>rank 的对称内存</strong>的 Tensor，底层是 NVLink 远程内存映射</td>
+</tr>
+<tr>
+  <td><code>barrier(channel)</code></td>
+  <td>跨 rank 同步屏障</td>
+  <td>基于 signal pad 的 spin-wait barrier。不同 channel 独立，可嵌套使用</td>
+</tr>
+<tr>
+  <td><code>stream_write_value32(tensor, index, value)</code></td>
+  <td>GPU 端原子写 signal</td>
+  <td>底层 <code>cuStreamWriteValue32</code>：在 write 前发出 system-level fence，保证之前的写操作对其他 GPU 可见</td>
+</tr>
+<tr>
+  <td><code>memset32(tensor, offset, val, count)</code></td>
+  <td>在 graph capture 模式下写 signal</td>
+  <td>替代 <code>stream_write_value32</code>，用于 CUDA graph 中（stream_write 不兼容 graph capture）</td>
+</tr>
+<tr>
+  <td><code>has_multicast_support(device_type, device_idx)</code></td>
+  <td>检查硬件是否支持 multicast</td>
+  <td>检测 GPU 架构是否支持 NVLink multicast（H100+ 支持）</td>
+</tr>
+<tr>
+  <td><code>multicast_ptr</code></td>
+  <td>获取 multicast 地址</td>
+  <td>返回 multicast 映射的基地址，写入此地址 = 同时写入所有 rank 的对应地址</td>
+</tr>
+<tr>
+  <td><code>put_signal(hdl, peer)</code></td>
+  <td>向远程 rank 发送 signal</td>
+  <td>NCCL backend: <code>ncclPutSignal</code></td>
+</tr>
+<tr>
+  <td><code>wait_signal(hdl, peer)</code></td>
+  <td>等待远程 rank 的 signal</td>
+  <td>NCCL backend: <code>ncclWaitSignal</code></td>
+</tr>
+<tr>
+  <td><code>rank</code> / <code>world_size</code></td>
+  <td>获取当前 rank 和 world size</td>
+  <td>从 group info 中获取</td>
+</tr>
+<tr>
+  <td><code>buffer_ptrs</code> / <code>buffer_ptrs_dev</code></td>
+  <td>获取所有 rank 的 buffer 地址（host/device）</td>
+  <td>用于 P2P 拷贝的地址查找</td>
+</tr>
+<tr>
+  <td><code>signal_pad_ptrs</code> / <code>signal_pad_ptrs_dev</code></td>
+  <td>获取 signal pad 地址</td>
+  <td>用于 barrier 和同步操作</td>
+</tr>
+<tr>
+  <td><code>get_remote_tensor(peer, size, dtype)</code></td>
+  <td>获取远程 rank tensor 的视图</td>
+  <td>仅当 <code>world_within_direct_access()</code> 为 True 时可用（NVLink 域内）</td>
+</tr>
+</table>
+
+<h4 style="color:var(--accent2); margin-top:16px;">3.7.1 Signal Pad — 对称内存的同步基础设施</h4>
+<p>每个对称内存分配都附带一块 <strong>signal pad</strong>——一块 P2P 可访问的特殊内存，用于跨 rank 同步。</p>
+
+<pre>
+<span class="comment"># Signal pad 的大小可以通过 API 调整</span>
+<span class="comment"># 默认大小足以支持常规的 barrier 操作</span>
+torch.distributed._symmetric_memory.<span class="func">set_signal_pad_size</span>(<span class="number">1024</span> * <span class="number">1024</span>)  <span class="comment"># 1MB</span>
+
+<span class="comment"># barrier(channel) 的底层逻辑：</span>
+<span class="comment">#   1. 每个 rank 写 signal pad 的自己的 slot (stream_write_value32)</span>
+<span class="comment">#   2. 每个 rank spin-wait 等所有其他 rank 的 slot 都被写入</span>
+<span class="comment">#   3. 所有 rank 都看到所有 signal 后，barrier 返回</span>
+<span class="comment">#   4. channel 参数决定使用 signal pad 的哪个偏移区域</span>
+</pre>
+
+<h4 style="color:var(--accent2); margin-top:16px;">3.7.2 <code>stream_write_value32</code> 的特殊性</h4>
+<p>这个函数是 <code>_fused_all_gather_matmul_native</code> 的核心魔法：</p>
+
+<pre>
+<span class="comment"># cuStreamWriteValue32 的语义：</span>
+<span class="comment">#   1. 在执行写操作之前，发出一个 system-level memory fence</span>
+<span class="comment">#   2. 这保证了 fence 之前的所有 memory 操作（如 copy_）对其他 GPU 可见</span>
+<span class="comment">#   3. 然后原子地写一个 uint32 值到指定地址</span>
+<span class="comment">#</span>
+<span class="comment"># _async_input_mm kernel 端的逻辑：</span>
+<span class="comment">#   while (signals[chunk_id] == 0) { /* spin wait */ }</span>
+<span class="comment">#   // signal != 0 意味着对应 chunk 的数据已经准备好</span>
+<span class="comment">#   // system-level fence 保证了数据可见性</span>
+<span class="comment">#   do_gemm_on_chunk(chunk_id);</span>
+
+<span class="comment"># 在 CUDA graph capture 模式下，stream_write_value32 不可用</span>
+<span class="comment"># 替代方案：memset32</span>
+<span class="keyword">if</span> <span class="keyword">not</span> torch.cuda.<span class="func">is_current_stream_capturing</span>():
+    _SymmetricMemory.<span class="func">stream_write_value32</span>(A_signals, rank, <span class="number">1</span>)
+<span class="keyword">else</span>:
+    _SymmetricMemory.<span class="func">memset32</span>(A_signals, offset=rank, val=<span class="number">1</span>, count=<span class="number">1</span>)
+</pre>
+
+<h4 style="color:var(--accent2); margin-top:16px;">3.7.3 Low-Contention 通信 — 不抢占 SM 的方式</h4>
+<p>当通信需要与密集计算重叠时，<strong>低争用（low-contention）</strong>版本牺牲一点通信吞吐，换取更好的重叠效率：</p>
+
+<pre>
+<span class="comment"># 文件: torch/distributed/_symmetric_memory/__init__.py</span>
+<span class="comment"># _low_contention_all_gather — 使用 Copy Engine 而不是 SM</span>
+
+<span class="keyword">def</span> <span class="func">_low_contention_all_gather</span>(tensor, group_name):
+    symm_mem = <span class="func">rendezvous</span>(tensor, group_name)
+    rank, world_size = symm_mem.rank, symm_mem.world_size
+    output = tensor.<span class="func">new_empty</span>(tensor.shape[<span class="number">0</span>] * world_size, *tensor.shape[<span class="number">1</span>:])
+    chunks = output.<span class="func">chunk</span>(world_size)
+
+    <span class="keyword">with</span> <span class="func">_get_backend_stream</span>():
+        <span class="keyword">if</span> <span class="keyword">not</span> input_is_symm_mem:
+            local_buf = symm_mem.<span class="func">get_buffer</span>(rank, tensor.shape, tensor.dtype)
+            local_buf.<span class="func">copy_</span>(tensor)  <span class="comment"># ← SM-based copy</span>
+
+        <span class="comment"># Pull: 从每个远程 rank 拉数据</span>
+        symm_mem.<span class="func">barrier</span>()
+        <span class="keyword">for</span> step <span class="keyword">in</span> <span class="func">range</span>(world_size):
+            remote_rank = (rank - step) % world_size
+            src_buf = symm_mem.<span class="func">get_buffer</span>(remote_rank, tensor.shape, tensor.dtype)
+            chunks[remote_rank].<span class="func">copy_</span>(src_buf)  <span class="comment"># ← Copy Engine P2P</span>
+        symm_mem.<span class="func">barrier</span>()
+
+<span class="comment"># _low_contention_reduce_scatter — Push + offline reduction</span>
+<span class="keyword">def</span> <span class="func">_low_contention_reduce_scatter</span>(tensor, reduce_op, group_name):
+    <span class="comment"># Push: 把数据推到远程 rank 的对称内存</span>
+    <span class="keyword">for</span> step <span class="keyword">in</span> <span class="func">range</span>(world_size):
+        remote_rank = (rank - step) % world_size
+        dst_buf = workspace.<span class="func">get_buffer</span>(remote_rank, ...)
+        dst_buf.<span class="func">copy_</span>(chunks[remote_rank])  <span class="comment"># ← Copy Engine P2P</span>
+    <span class="comment"># Offline reduction: 在本地对所有 rank 推过来的数据做 sum</span>
+    ret = a2a_res.<span class="func">unflatten</span>(<span class="number">0</span>, (world_size, -<span class="number">1</span>)).<span class="func">sum</span>(dim=<span class="number">0</span>)
+</pre>
+
+<div class="highlight-box">
+<strong>Low-Contention 的设计哲学：</strong>常规通信（如 NCCL）会将整个集合通信融合成一个 kernel，占用大量 SM。当通信与计算重叠时，这会<strong>抢夺计算所需的 SM 资源</strong>。Low-contention 版本拆分成多个小 kernel，优先使用 Copy Engine（DMA 引擎，不占 SM），只在必要的 reduction 步骤使用 SM，从而减少与计算的争用。
+</div>
+</div>
+
+<h3>3.8 量化 GEMM 的融合变体</h3>
+
+<div class="card">
+<p>除了标准 BF16 GEMM，vLLM 还支持 FP8 量化 GEMM 的融合变体（仅限 bfloat16 模型）：</p>
+
+<table>
+<tr><th>融合算子</th><th>匹配的图模式</th><th>说明</th></tr>
+<tr>
+  <td><code>fused_all_gather_matmul</code></td>
+  <td>all_gather → mm</td>
+  <td>标准 BF16 聚合+GEMM</td>
+</tr>
+<tr>
+  <td><code>fused_matmul_reduce_scatter</code></td>
+  <td>mm → reduce_scatter</td>
+  <td>标准 BF16 GEMM+散播</td>
+</tr>
+<tr>
+  <td><code>fused_all_gather_scaled_matmul</code></td>
+  <td>all_gather → scaled_mm (FP8)</td>
+  <td>FP8 量化 GEMM 的聚合融合</td>
+</tr>
+<tr>
+  <td><code>fused_scaled_matmul_reduce_scatter</code></td>
+  <td>scaled_mm (FP8) → reduce_scatter</td>
+  <td>FP8 量化 GEMM 的散播融合</td>
+</tr>
+</table>
+</div>
+
+<!-- ================================================================== -->
+<h2>4. all_reduce 的决策路径 — 谁先谁后？</h2>
+
+<p>当一个 all_reduce 请求到来时，<code>CudaCommunicator.all_reduce()</code> 会按照以下优先级选择通信后端：</p>
+
+<div class="card">
+<div class="step-flow" style="flex-direction:column; align-items:stretch;">
+  <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
+    <span style="font-weight:700; color:var(--accent3); min-width:20px;">①</span>
+    <div class="step-box sync" style="flex:1;">NCCL SymmMem all_reduce (路径B) — <code>all_reduce_symmetric_with_copy</code></div>
+    <span style="color:var(--text-muted); font-size:0.85em;">大张量 & 小张量时优先</span>
+  </div>
+  <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
+    <span style="font-weight:700; color:var(--accent5); min-width:20px;">②</span>
+    <div class="step-box comp" style="flex:1;">Custom AllReduce — vLLM 自研 P2P kernel</div>
+    <span style="color:var(--text-muted); font-size:0.85em;">中等张量时优先</span>
+  </div>
+  <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
+    <span style="font-weight:700; color:var(--accent); min-width:20px;">③</span>
+    <div class="step-box comm" style="flex:1;">PyTorch SymmMem all_reduce (路径A) — <code>multimem_all_reduce_</code></div>
+    <span style="color:var(--text-muted); font-size:0.85em;">fallback</span>
+  </div>
+  <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
+    <span style="font-weight:700; color:var(--text-muted); min-width:20px;">④</span>
+    <div class="step-box" style="flex:1; border-color:var(--text-muted); color:var(--text-muted);">NCCL 原生 all_reduce</div>
+    <span style="color:var(--text-muted); font-size:0.85em;">最终 fallback</span>
+  </div>
+</div>
+</div>
+
+<div class="warn-box">
+<strong>注意：</strong>路径 A 和路径 B 的 all_reduce <strong>不会同时用在同一个 all_reduce 调用</strong>。它们是互斥的后备选项。但路径 A 的<strong>融合算子</strong>（fused_all_gather_matmul 等）是独立于这条 all_reduce 路径的——它们在图优化阶段就已经被替换了，不会走到 all_reduce 的决策路径。
+</div>
+
+<!-- ================================================================== -->
+<h2>5. 端到端数据流 — 一个 Transformer 层的完整旅程</h2>
+
+<div class="pipeline-container">
+<div class="pipeline-title">经过三层优化后的 Transformer 层执行流 — 两种融合模式交替出现</div>
+<svg width="100%" viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="940" height="480" fill="#161b22" rx="8"/>
+
+  <!-- Title labels -->
+  <text x="470" y="28" fill="#e6edf3" font-size="14" font-weight="700" text-anchor="middle">单个 Transformer 层 (Attention + MLP)</text>
+
+  <!-- Column labels -->
+  <text x="30" y="50" fill="#6a737d" font-size="10">Attention 侧</text>
+  <text x="30" y="250" fill="#6a737d" font-size="10">MLP 侧</text>
+
+  <!-- Defs for arrows -->
+  <defs>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto">
+      <polygon points="0,0 8,4 0,8" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto">
+      <polygon points="0,0 8,4 0,8" fill="#7ee787"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto">
+      <polygon points="0,0 8,4 0,8" fill="#f0883e"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto">
+      <polygon points="0,0 8,4 0,8" fill="#d2a8ff"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto">
+      <polygon points="0,0 8,4 0,8" fill="#ff7b72"/>
+    </marker>
+  </defs>
+
+  <!-- ====== Attention Block ====== -->
+  <!-- Step 1: Input -->
+  <rect x="20" y="55" width="120" height="45" rx="8" fill="rgba(139,148,158,0.15)" stroke="#8b949e" stroke-width="1.5"/>
+  <text x="80" y="74" fill="#8b949e" font-size="11" text-anchor="middle">x_shard</text>
+  <text x="80" y="90" fill="#6a737d" font-size="9" text-anchor="middle">(本地分片)</text>
+
+  <!-- Arrow -->
+  <line x1="140" y1="77" x2="160" y2="77" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrowBlue)"/>
+
+  <!-- Step 2: fused_all_gather_matmul (QKV) — 模式 A -->
+  <rect x="165" y="47" width="220" height="60" rx="8" fill="rgba(88,166,255,0.1)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="275" y="66" fill="#58a6ff" font-size="12" font-weight="600" text-anchor="middle">fused_all_gather_matmul</text>
+  <text x="275" y="82" fill="#8b949e" font-size="10" text-anchor="middle">AG + QKV GEMM 流水线重叠</text>
+  <text x="275" y="98" fill="#58a6ff" font-size="9" text-anchor="middle">【模式 A: 通信先行 → 计算跟后】</text>
+
+  <!-- Arrow -->
+  <line x1="385" y1="77" x2="405" y2="77" stroke="#7ee787" stroke-width="2" marker-end="url(#arrowGreen)"/>
+
+  <!-- Step 3: Attention (local) -->
+  <rect x="410" y="55" width="130" height="45" rx="8" fill="rgba(126,231,135,0.1)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="475" y="74" fill="#7ee787" font-size="11" text-anchor="middle">Attention</text>
+  <text x="475" y="90" fill="#6a737d" font-size="9" text-anchor="middle">本地计算</text>
+
+  <!-- Arrow -->
+  <line x1="540" y1="77" x2="560" y2="77" stroke="#f0883e" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <!-- Step 4: fused_matmul_reduce_scatter (O_proj) — 模式 B -->
+  <rect x="565" y="47" width="260" height="60" rx="8" fill="rgba(240,136,62,0.1)" stroke="#f0883e" stroke-width="2"/>
+  <text x="695" y="66" fill="#f0883e" font-size="12" font-weight="600" text-anchor="middle">fused_matmul_reduce_scatter</text>
+  <text x="695" y="82" fill="#8b949e" font-size="10" text-anchor="middle">O_proj GEMM + RS 流水线重叠</text>
+  <text x="695" y="98" fill="#f0883e" font-size="9" text-anchor="middle">【模式 B: 计算先行 → 通信跟后】</text>
+
+  <!-- Arrow down to RMSNorm -->
+  <line x1="695" y1="107" x2="695" y2="125" stroke="#d2a8ff" stroke-width="2" marker-end="url(#arrowPurple)"/>
+
+  <!-- RMSNorm -->
+  <rect x="625" y="130" width="140" height="35" rx="8" fill="rgba(210,168,255,0.1)" stroke="#d2a8ff" stroke-width="1.5"/>
+  <text x="695" y="152" fill="#d2a8ff" font-size="11" text-anchor="middle">RMSNorm (本地)</text>
+
+  <!-- ====== MLP Block ====== -->
+  <!-- Arrow down to MLP -->
+  <line x1="695" y1="165" x2="695" y2="190" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrowBlue)"/>
+
+  <!-- Step 5: fused_all_gather_matmul (gate/up) — 模式 A -->
+  <rect x="565" y="195" width="260" height="60" rx="8" fill="rgba(88,166,255,0.1)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="695" y="214" fill="#58a6ff" font-size="12" font-weight="600" text-anchor="middle">fused_all_gather_matmul</text>
+  <text x="695" y="230" fill="#8b949e" font-size="10" text-anchor="middle">AG + gate/up GEMM 流水线重叠</text>
+  <text x="695" y="246" fill="#58a6ff" font-size="9" text-anchor="middle">【模式 A: 通信先行 → 计算跟后】</text>
+
+  <!-- Arrow -->
+  <line x1="565" y1="225" x2="545" y2="225" stroke="#7ee787" stroke-width="2" marker-end="url(#arrowGreen)"/>
+
+  <!-- Step 6: Activation + Down Proj -->
+  <rect x="370" y="205" width="170" height="40" rx="8" fill="rgba(126,231,135,0.1)" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="455" y="222" fill="#7ee787" font-size="11" text-anchor="middle">SiLU + down_proj</text>
+  <text x="455" y="238" fill="#6a737d" font-size="9" text-anchor="middle">本地 GEMM</text>
+
+  <!-- Arrow -->
+  <line x1="370" y1="225" x2="350" y2="225" stroke="#f0883e" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <!-- Step 7: fused_matmul_reduce_scatter (down_proj) — 模式 B -->
+  <rect x="75" y="195" width="270" height="60" rx="8" fill="rgba(240,136,62,0.1)" stroke="#f0883e" stroke-width="2"/>
+  <text x="210" y="214" fill="#f0883e" font-size="12" font-weight="600" text-anchor="middle">fused_matmul_reduce_scatter</text>
+  <text x="210" y="230" fill="#8b949e" font-size="10" text-anchor="middle">down_proj GEMM + RS 流水线重叠</text>
+  <text x="210" y="246" fill="#f0883e" font-size="9" text-anchor="middle">【模式 B: 计算先行 → 通信跟后】</text>
+
+  <!-- Arrow down -->
+  <line x1="210" y1="255" x2="210" y2="275" stroke="#d2a8ff" stroke-width="2" marker-end="url(#arrowPurple)"/>
+
+  <!-- RMSNorm -->
+  <rect x="140" y="280" width="140" height="35" rx="8" fill="rgba(210,168,255,0.1)" stroke="#d2a8ff" stroke-width="1.5"/>
+  <text x="210" y="302" fill="#d2a8ff" font-size="11" text-anchor="middle">RMSNorm (本地)</text>
+
+  <!-- Output -->
+  <rect x="140" y="325" width="140" height="35" rx="8" fill="rgba(139,148,158,0.15)" stroke="#8b949e" stroke-width="1.5"/>
+  <text x="210" y="347" fill="#8b949e" font-size="11" text-anchor="middle">x_shard' → 下一层</text>
+
+  <!-- ====== Pattern Summary ====== -->
+  <rect x="20" y="375" width="880" height="95" rx="8" fill="rgba(139,148,158,0.05)" stroke="#30363d" stroke-width="1"/>
+  <text x="460" y="395" fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">规律：两种融合模式在 Transformer 层中交替出现</text>
+
+  <!-- Pattern A summary -->
+  <rect x="40" y="405" width="400" height="50" rx="6" fill="rgba(88,166,255,0.08)" stroke="#58a6ff" stroke-width="1"/>
+  <text x="240" y="422" fill="#58a6ff" font-size="11" font-weight="600" text-anchor="middle">模式 A: fused_all_gather_matmul (AG → GEMM)</text>
+  <text x="240" y="440" fill="#8b949e" font-size="10" text-anchor="middle">出现在每个 GEMM 的输入侧（QKV, gate/up_proj）</text>
+
+  <!-- Pattern B summary -->
+  <rect x="460" y="405" width="420" height="50" rx="6" fill="rgba(240,136,62,0.08)" stroke="#f0883e" stroke-width="1"/>
+  <text x="670" y="422" fill="#f0883e" font-size="11" font-weight="600" text-anchor="middle">模式 B: fused_matmul_reduce_scatter (GEMM → RS)</text>
+  <text x="670" y="440" fill="#8b949e" font-size="10" text-anchor="middle">出现在每个 GEMM 的输出侧（O_proj, down_proj）</text>
+</svg>
+</div>
+
+<!-- ================================================================== -->
+<h2>6. NCCL SymmMem 的智能调度</h2>
+
+<div class="card">
+<p>
+路径 B 虽然没有流水线重叠的能力，但它通过零拷贝在特定场景下能获得显著加速。vLLM 基于实测数据做了一个<strong>自适应选择策略</strong>：
+</p>
+
+<pre>
+<span class="comment"># 文件: vllm/distributed/device_communicators/all_reduce_utils.py</span>
+
+<span class="comment"># 基于 H100 和 GB200 实测的配置</span>
+<span class="comment"># 8 GPU 时：</span>
+<span class="comment">#   2K - 16K:  PyNCCL-symm 胜出 (1.35x - 1.48x 加速)</span>
+<span class="comment">#   32K - 64K: Custom_AR 胜出</span>
+<span class="comment">#   128K - 1G: PyNCCL-symm 胜出 (1.12x - 6.14x 加速)</span>
+
+<span class="keyword">def</span> <span class="func">should_nccl_symm_mem_allreduce</span>(world_size, input_tensor):
+    tensor_size = input_tensor.nbytes
+
+    <span class="comment"># 小张量 → NCCL symm_mem (低延迟)</span>
+    <span class="comment"># 中等张量 → Custom AR (P2P 更快)</span>
+    <span class="comment"># 大张量 → NCCL symm_mem (高带宽)</span>
+    <span class="keyword">if</span> world_size == <span class="number">4</span>:
+        <span class="keyword">return</span> tensor_size <= <span class="number">16</span>K <span class="keyword">or</span> tensor_size >= <span class="number">512</span>K
+    <span class="keyword">elif</span> world_size == <span class="number">8</span>:
+        <span class="keyword">return</span> tensor_size <= <span class="number">16</span>K <span class="keyword">or</span> tensor_size >= <span class="number">128</span>K
+</pre>
+</div>
+
+<!-- ================================================================== -->
+<h2>7. 总结：两套路径的协作关系</h2>
+
+<div class="card card-glow" style="border: 2px solid var(--accent4);">
+<p>两套对称内存路径<strong>不是替代关系，而是互补关系</strong>：</p>
+
+<table>
+<tr>
+  <th>场景</th>
+  <th>使用的路径</th>
+  <th>效果</th>
+</tr>
+<tr>
+  <td>Async TP 融合 GEMM+通信</td>
+  <td><span class="tag tag-pytorch">路径 A</span></td>
+  <td>通信+计算流水线重叠，延迟 ≈ max(comm, comp)</td>
+</tr>
+<tr>
+  <td>独立 all_reduce (大/小张量)</td>
+  <td><span class="tag tag-nccl">路径 B</span></td>
+  <td>零拷贝，省去 copy-in/copy-out 开销</td>
+</tr>
+<tr>
+  <td>独立 all_reduce (中等张量)</td>
+  <td>Custom AR</td>
+  <td>P2P 直传，无需额外缓冲区</td>
+</tr>
+<tr>
+  <td>图捕获 (CUDA Graph)</td>
+  <td>两者都支持</td>
+  <td>路径 B 需要 pool ID 切换；路径 A 的融合算子天然支持</td>
+</tr>
+</table>
+
+<div class="highlight-box" style="margin-top:20px;">
+<p><strong>终极效果：</strong>在一个 Transformer 层中，QKV/GMLP 的 GEMM 计算与 AllGather/ReduceScatter 通信通过路径 A 的融合算子完美重叠，残余的独立 all_reduce 通过路径 B 零拷贝加速。两层合力，将通信延迟几乎完全隐藏在计算背后。</p>
+</div>
+</div>
+
+<!-- ================================================================== -->
+<h2>8. 环境变量速查</h2>
+
+<table>
+<tr><th>环境变量</th><th>默认值</th><th>作用</th></tr>
+<tr>
+  <td><code>VLLM_ALLREDUCE_USE_SYMM_MEM</code></td>
+  <td><code>1</code></td>
+  <td>启用路径 A — PyTorch SymmetricMemory（融合算子 + multimem all_reduce）</td>
+</tr>
+<tr>
+  <td><code>VLLM_USE_NCCL_SYMM_MEM</code></td>
+  <td><code>0</code></td>
+  <td>启用路径 B — NCCL 对称内存分配器（零拷贝 all_reduce）</td>
+</tr>
+<tr>
+  <td><code>TORCH_SYMM_MEM_DISABLE_MULTICAST</code></td>
+  <td>-</td>
+  <td>禁用 NVLink multicast（回退到 two_shot 算法）</td>
+</tr>
+<tr>
+  <td><code>VLLM_BATCH_INVARIANT</code></td>
+  <td>-</td>
+  <td>设为 1 时两条路径都禁用（用于调试）</td>
+</tr>
+</table>
+
+<div style="margin-top:48px; padding-top:24px; border-top:1px solid var(--border); color:var(--text-muted); font-size:0.9em; text-align:center;">
+  基于 vLLM main 分支源码分析 · 源文件: symm_mem.py, pynccl_allocator.py, all_reduce_utils.py, cuda_communicator.py, collective_fusion.py
+</div>
+
+</div>
+</body>
+</html>
