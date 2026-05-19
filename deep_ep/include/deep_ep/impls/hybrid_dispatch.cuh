@@ -153,8 +153,8 @@ hybrid_dispatch_impl(
     //     │     编码: (到达SM数 << 32) | 计数值                                    │
     //     ├─────────────────────────────────────────────────────────────────────────┤
     //     │ [2] Scaleup rank+expert count  (send + recv 各一份)                    │
-    //     │     send: 本节点写入, NVLink put → 对端 recv                          │
-    //     │     编码: (到达 scaleup rank 数 << 32) | 计数值                        │
+    //     │     send: 仅 dispatch.cuh 非 NVLink 模式使用, 本文件不用               │
+    //     │     recv: 对端 put_value / red_add_rel 写入, 本端读取                  │
     //     ├─────────────────────────────────────────────────────────────────────────┤
     //     │ [3] Scaleup atomic sender counter  kNumMaxRanks × 4B                  │
     //     │     forward warp 用 atomicAdd 分配 scaleup_buffer slot                │
@@ -328,21 +328,24 @@ hybrid_dispatch_impl(
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
+
             // Step 5: 跨节点发送 — 把本节点的 rank/expert 计数 RDMA put 到所有其他节点
             //   每个 thread 负责一个 scaleout rank (thread_idx < kNumScaleoutRanks)
-            //   gin.put: RDMA 写到对端节点的 workspace
-            //     src: 本节点编码后的计数 (send buffer)
-            //     dst: 对端节点的接收区 (recv buffer)
+            //   gin.put(recv_sym_ptr, send_sym_ptr, ...): RDMA 写到对端节点的 workspace
+            //     第1个参数 recv_sym_ptr: 对端节点的接收区 (recv buffer, <false>) → dst
+            //     第2个参数 send_sym_ptr: 本节点编码后的计数 (send buffer, <true>) → src
             //   两种计数分开 put:
             //     - rank_count: kNumScaleupRanks 个 int (每 rank 一个)
             //     - expert_count: kNumExpertsPerScaleout 个 int (每 expert 一个)
             EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyThreads,
                              "kNumScaleoutRanks must be less than kNumNotifyThreads");
+            // ⚠️ All to All
             if (thread_idx < kNumScaleoutRanks) {
+                // 一个thread 负责发送给一个 scaleout rank
                 const auto dst_scaleout_rank_idx = thread_idx;
                 gin.put<ncclTeamTagRail>(
-                    workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),
-                    workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),
+                    workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),  //recv_sym_ptr：远端接收区地址 → dst
+                    workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),//send_sym_ptr：本地发送区地址 → src
                     kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx,
                     ncclGinOptFlagsAggregateRequests);
                 gin.put<ncclTeamTagRail>(
@@ -351,6 +354,7 @@ hybrid_dispatch_impl(
                     kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx);
             }
             __syncwarp();
+
 
             // Step 6: 接收其他节点的计数 + 节点内聚合
             // recv_and_reduce: 遍历所有 scaleout rank, 等待其 RDMA 数据到达, 解码求和
@@ -364,6 +368,7 @@ hybrid_dispatch_impl(
                     const auto ptr = get_ptr_func(j);
                     int decoded;
                     comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check){
+                        // -n-1, -(n-1)-1 = -n+1-1 = n
                         decoded = math::encode_decode_positive(ptx::ld_acquire_sys<int>(ptr));
                         if (math::is_decoded_positive_ready(decoded))
                             return true;
@@ -392,14 +397,24 @@ hybrid_dispatch_impl(
             //   高 32 位 = 到达的 scaleup rank 数 (用于对端判断是否所有 scaleup rank 都写了)
             #pragma unroll
             for (int i = thread_idx; i < kNumScaleupRanks; i += kNumNotifyThreads) {
+                // ⚠️ All to All 之后求和，等价于 Reduce-Scatter
+                // 每一个thread，各自等待所有scaleout rank的rank_count[i]到达，然后求和
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
                     return workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_peer_idx, i);
                 });
 
+                // 当前节点的nvl rank i的累加值算好了，
+                // ⚠️ 高 32 位是 scaleup rank 总数（用于对端判断是否收齐），低 32 位是聚合后的 token 计数
+                // ⚠️ 接收方阻塞等待 高32位 == kNumRanks, 就意味着该数可用了
                 const int64_t counter = (static_cast<int64_t>(kNumScaleupRanks) << 32ll) | count;
+
+                // ncclTeamTagLsa 就是 NVLink 通信的 tag
+                // put_value 内部会通过 ncclTeamTagLsa 获取第 i 个 GPU 的对称地址，然后用 st_relaxed_sys 直接 NVLink 写入
+                // ⚠️ 节点内 All to All
                 gin.put_value<ncclTeamTagLsa>(
-                    workspace_layout.get_scaleup_rank_count_ptr<false>() + scaleup_rank_idx,
-                    counter, i);
+                    workspace_layout.get_scaleup_rank_count_ptr<false>() + scaleup_rank_idx, // sym_ptr: 对端 rank 的接收地址
+                    counter,   // value: 要写入的值
+                    i); // dst_rank_idx: 目标 scaleup rank 编号
             }
             __syncwarp();
 
@@ -410,6 +425,7 @@ hybrid_dispatch_impl(
             //     注意: expert 是按 rank 分配的, i/kNumExpertsPerRank = 目标 scaleup rank
             #pragma unroll
             for (int i = thread_idx; i < kNumExpertsPerScaleout; i += kNumNotifyThreads) {
+                // ⚠️ All to All 之后求和，等价于 Reduce-Scatter
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
                     return workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_peer_idx, i);
                 }, true);
@@ -421,8 +437,9 @@ hybrid_dispatch_impl(
                 const int64_t counter = (1ll << 32ll) | count;
                 const auto dst_scaleup_rank_idx = i / kNumExpertsPerRank;
                 const auto expert_idx_in_dst_rank = i % kNumExpertsPerRank;
+                // ⚠️ 节点内就不作All to All，直接求sum吧， 相当于直接Reduce Scatter
                 gin.red_add_rel<ncclTeamTagLsa>(
-                    workspace_layout.get_scaleup_expert_count_ptr<false>() + expert_idx_in_dst_rank,
+                    workspace_layout.get_scaleup_expert_count_ptr<false>() + expert_idx_in_dst_rank, // sym_ptr: 对端 rank 的接收地址
                     counter, dst_scaleup_rank_idx);
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
@@ -509,7 +526,7 @@ hybrid_dispatch_impl(
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
         }
-        
+
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         // ==================== Phase 2: Scaleout Warps (跨节点发送) ====================
         // 职责: 从本地 x 读取 token → RDMA 发送到其他节点 + 本地直写

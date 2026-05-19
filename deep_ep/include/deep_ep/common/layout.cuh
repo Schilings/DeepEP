@@ -27,12 +27,14 @@ namespace deep_ep::elastic::layout {
  *           red_add 到这里, 高 32 位=到达 SM 数, 低 32 位=计数值
  *
  *   16 + N  Scaleup rank+expert count (send buffer)      (kNumMaxRanks + kNumMaxExperts) * 8 bytes
- *           本节点发给对端 scaleup rank 的 rank/expert 计数
+ *           仅 dispatch.cuh (非 NVLink 模式) 使用:
+ *           本节点编码后的 rank/expert 计数, 供 RDMA put 发送
+ *           hybrid_dispatch.cuh 不使用此区域 (put_value 直接写对端 recv)
  *           编码: (到达 scaleup rank 数 << 32) | 计数值
  *
  *   16+2N   Scaleup rank+expert count (recv buffer)      (kNumMaxRanks + kNumMaxExperts) * 8 bytes
- *           从对端 scaleup rank 收到的 rank/expert 计数
- *           解码后存入 smem, 供 prefix sum 使用
+ *           对端 scaleup rank 通过 NVLink put_value / red_add_rel 写入
+ *           本节点读取后解码, 存入 smem 供 prefix sum 使用
  *
  *   16+4N   Scaleup atomic sender counter                 kNumMaxRanks * 4 bytes
  *           forward warp 用 atomicAdd 分配 scaleup_buffer slot
@@ -125,9 +127,9 @@ struct WorkspaceLayout {
 
         // [2] Scaleup rank+expert count (send + recv 各一份)
         //   每份: kNumMaxRanks 个 int64_t (rank) + kNumMaxExperts 个 int64_t (expert)
-        //   send buffer: 本节点写入, NVLink put 到对端
-        //   recv buffer: 对端写入, 本节点读取
-        //   编码: (到达 scaleup rank 数 << 32) | 计数值
+        //   send buffer: 仅 dispatch.cuh 非 NVLink 模式使用 (RDMA put 源)
+        //                hybrid_dispatch.cuh 不使用 (put_value 直接写对端 recv)
+        //   recv buffer: 对端 scaleup rank 通过 NVLink put_value / red_add_rel 写入
         num_bytes += kNumMaxRanks * sizeof(int64_t) * 2;
         num_bytes += kNumMaxExperts * sizeof(int64_t) * 2;
 
@@ -186,8 +188,12 @@ struct WorkspaceLayout {
 
     // ==================== Scaleup Rank/Expert Count ====================
     // 位置: 紧接在 notify reduction 之后
-    // kIsSendBuffer=true:  send buffer (本节点写入)
-    // kIsSendBuffer=false: recv buffer (对端写入, 本节点读取)
+    // kIsSendBuffer=true:  send buffer (本节点写入, 供 RDMA put 发送)
+    //   注意: hybrid_dispatch.cuh 不使用此区域!
+    //         它用 put_value/red_add_rel 直接写对端的 recv buffer,
+    //         不需要本地 send buffer 做暂存。
+    //         仅 dispatch.cuh 的非 NVLink 模式 (kIsScaleupNVLink=false) 使用。
+    // kIsSendBuffer=false: recv buffer (对端通过 NVLink 写入, 本节点读取)
     //
     // 内存结构 (send 和 recv 布局相同):
     //   [0..num_scaleup_ranks-1]: rank_count (每 scaleup rank 一个 int64_t)
