@@ -180,7 +180,9 @@ dispatch_impl(
     // lane_idx: warp内线程索引 (0~31)
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
+    // get_warp_idx: PTX mov.s32 %laneid + shfl, 获取当前线程在 block 中的 warp 索引
     const auto warp_idx = ptx::get_warp_idx();
+    // get_lane_idx: PTX mov.s32 %laneid, 获取当前线程在 warp 内的索引 (0~31)
     const auto lane_idx = ptx::get_lane_idx();
 
     // ========== 工作空间布局 ==========
@@ -290,8 +292,37 @@ dispatch_impl(
         sm_idx, warp_idx - kNumNotifyWarps, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // ========== 网格同步Barrier ==========
-    // 确保所有SM在开始前都就绪,无TMA store flush,无prologue grid sync
+    // ========== 开始前 Barrier ==========
+    // gpu_barrier 模板签名:
+    //   template<bool kIsScaleupNVLink,
+    //            int kNumScaleoutRanks, int kNumScaleupRanks,
+    //            int kNumSMs, int kNumThreads, int kNumQPs,
+    //            int64_t kNumTimeoutCycles, int kTag,
+    //            bool kFlushStores, bool kSyncAtStart, bool kSyncAtEnd>
+    //
+    //   参数对照:
+    //   模板参数                类型      本调用值         含义
+    //   ──────────────────     ──────    ──────────       ──────────
+    //   kIsScaleupNVLink       bool      运行时           节点内通信走 NVLink 还是 RDMA
+    //   kNumScaleoutRanks      int       1                跨节点 rank 数 (dispatch 无跨节点,=1)
+    //   kNumScaleupRanks       int       kNumRanks        节点内 rank 数
+    //   kNumSMs                int       kNumSMs          使用的 SM 数量
+    //   kNumThreads            int       kNumThreads      每 SM 线程数
+    //   kNumQPs                int       kNumQPs          QP (Queue Pair) 数量
+    //   kNumTimeoutCycles      int64     kNumTimeoutCycles 防死锁超时周期数
+    //   kTag                   int       kDispatchTag0    barrier 标签 (区分不同阶段)
+    //   kFlushStores           bool      false            不 flush TMA store (还没发数据)
+    //   kSyncAtStart           bool      false            barrier 前不 grid sync (各自开始)
+    //   kSyncAtEnd             bool      true             barrier 后 grid sync (等所有 SM 一起开始干活)
+    //
+    //   运行时参数             本调用值         含义
+    //   ──────────────────     ──────────       ──────────
+    //   gin                    NCCLGin          通信句柄
+    //   workspace_layout       workspace        工作区布局
+    //   scaleout_rank_idx      0                跨节点 rank 索引 (无跨节点,=0)
+    //   scaleup_rank_idx       rank_idx         节点内 rank 索引
+    //   sm_idx                 sm_idx           当前 SM 编号
+    //   thread_idx             thread_idx       当前线程编号
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
@@ -398,11 +429,13 @@ dispatch_impl(
             // 计算目标 rank 索引
             const auto dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
 
-            // deduplicate: 同一 warp 内同一 rank 只计算一次
-            // 只有 lane 0 会执行 atomicAdd (基于 lane 0 的值为准)
+            // deduplicate: warp 内按 value 去重, 只让每个唯一值对应的最高 lane 执行
+            //   实现: match(value) 找相同值的 lane 掩码, get_master_lane_idx 取最高位, 与自身 lane_idx 比较
             if (ptx::deduplicate(dst_rank_idx, lane_idx) and dst_rank_idx >= 0)
                 atomicAdd_block(rank_count + dst_rank_idx, 1);
         }
+        // named_barrier: PTX bar.sync, 命名屏障, 指定参与线程数同步
+        //   kNotifyBarrierIndex=1 隔离 Notify Warps 和 Dispatch Warps 的同步
         ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
         /**
@@ -434,6 +467,8 @@ dispatch_impl(
         #pragma unroll
         for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
             const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
+            // red_add: PTX red.gpu.global.add.u64, 全局内存原子加法 (GPU域, 无内存序保证)
+            //   将 counter 累加到 workspace 的归约区域, 多个 SM 的计数通过原子加合并
             ptx::red_add(workspace_layout.get_notify_reduction_workspace_ptr() + i, counter);
         }
 
@@ -458,6 +493,8 @@ dispatch_impl(
             #pragma unroll
             for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
                 comm::timeout_while<kNumTimeoutCycles>(true, [=](const bool& is_last_check) {
+                    // ld_volatile: PTX ld.volatile.global, volatile 加载 (编译器不优化/重排)
+                    //   保证每次都从内存读取最新值, 用于轮询检查远程写入的归约状态
                     const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_notify_reduction_workspace_ptr() + i);
                     if ((status >> 32) == kNumSMs) {
                         // 编码/解码正数 (用于传输)
@@ -627,6 +664,8 @@ dispatch_impl(
             const auto start_clock = clock64();
             for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
                 comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                    // ld_volatile: PTX ld.volatile.global, volatile 加载, 保证读取最新值
+                    //   用于轮询远程 rank 通过 NVLink/RDMA 写入的 count
                     const auto count = static_cast<int>(
                         ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + i));
                     const auto decoded = math::encode_decode_positive(count);
@@ -703,6 +742,28 @@ dispatch_impl(
              *   输入: [16, 16, 16, 16] (每个local expert的token数,已对齐)
              *   输出: [16, 32, 48, 64] (每个expert的起始偏移)
              */
+            // do_psum: 用单个 Warp(32 lanes) 以 32 为粒度分块做 prefix sum
+            // 核心思路: 分块扫描 + 跨块传递 (block-scan + carry propagation)
+            //
+            // warp_inclusive_sum: Warp 内 inclusive scan, 用 __shfl_up_sync 实现
+            //   例: 4 lanes 输入 [3,1,4,2] → 输出 [3,4,8,10]
+            //
+            // exchange(sum, 31): 本质是 __shfl_sync(0xffffffff, sum, 31)
+            //   即所有 lane 都从 lane 31 获取值 → 拿到当前块的累加总和, 作为下一轮的 psum 基数
+            //
+            // is_exclusive 巧妙设计: mem_idx = idx - is_exclusive
+            //   is_exclusive=0 (inclusive): out[i] = sum(count[0..i])
+            //     例: [10,5,8,3] → [10,15,23,26]
+            //   is_exclusive=1 (exclusive): out[i] = sum(count[0..i-1]), lane 0 读 mem_idx=-1 → value=0
+            //     例: [10,5,8,3] → [0,10,15,23]
+            //     同时循环上界变为 ceil_div(n+1, 32), 多输出一个元素
+            //
+            // 完整流程示例 (n=64, is_exclusive=1):
+            //   i=0: lane 0~31, mem_idx=-1~30, warp_inclusive_sum 后加上 psum=0
+            //        out[0]=0, out[1]=c0, ..., out[31]=c0+..+c30
+            //        psum = exchange(sum, 31) = c0+..+c30 (块累加和)
+            //   i=1: lane 0~31, mem_idx=31~62, warp_inclusive_sum 后加上 psum
+            //        out[32]=c0+..+c31, ..., out[63]=c0+..+c62
             const auto do_psum = [=](const int* count, int* out, const int n, const int is_exclusive) {
                 int psum = 0;
                 #pragma unroll
@@ -711,14 +772,14 @@ dispatch_impl(
                     const auto mem_idx = idx - is_exclusive;
                     const auto value = (0 <= mem_idx and mem_idx < n) ? count[mem_idx] : 0;
 
-                    // Warp 内 inclusive sum
+                    // Warp 内 inclusive sum (使用 __shfl_up_sync 实现)
                     const auto sum = psum + ptx::warp_inclusive_sum(value, lane_idx);
 
                     // 写入全局内存
                     if (idx < n + is_exclusive)
                         out[idx] = sum;
 
-                    // 更新 psum, 使用最后一个 lane 的值
+                    // 更新 psum: 所有 lane 从 lane 31 获取块累加总和, 作为下一轮的基数
                     psum = ptx::exchange(sum, 31);
                 }
             };
@@ -833,9 +894,12 @@ dispatch_impl(
          *   2. Leader 初始化 mbarrier,值为1 (等待一个 arrive)
          *   3. 所有线程 __syncwarp()
          */
-        ptx::arrival_phase phase = 0;
+        ptx::arrival_phase phase = 0;  // mbarrier 相位, 每次 wait 后翻转 (phase ^= 1)
         const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
+        // elect_one_sync: PTX elect.sync, 从 warp 中选举一个 lane 执行 (硬件随机,低开销)
         if (ptx::elect_one_sync())
+            // mbarrier_init_with_fence: PTX mbarrier.init + fence.mbarrier_init.release.cluster
+            //   初始化 mbarrier, arrive_count=1 (等待1次arrive即可通过), 并插入cluster级fence
             ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
         __syncwarp();
 
@@ -866,6 +930,8 @@ dispatch_impl(
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
 
             // ========== 等待上一个 token 的 TMA store 完成 ==========
+            // tma_store_wait: PTX cp.async.bulk.wait_group, 等待 TMA 异步 store 完成
+            //   参数 0 = 等待所有 pending 的 TMA store 完成
             ptx::tma_store_wait();
             __syncwarp();
 
@@ -883,7 +949,10 @@ dispatch_impl(
              *   │  目的地址: tma_buffer.hidden_ptr (smem)                │
              *   └─────────────────────────────────────────────────────────┘
              */
-            if (ptx::elect_one_sync()) {
+            if (ptx::elect_one_sync())  // elect: 选举一个 lane 执行 TMA load
+                // tma_load_1d: PTX cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes
+                //   TMA 硬件加速的 1D 批量异步加载: global→shared, 完成时自动通知 mbarrier
+                //   参数: smem_dst, gmem_src, mbarrier(用于同步), num_bytes, cache_hint
                 ptx::tma_load_1d(tma_buffer.get_hidden_ptr(), math::advance_ptr(x, token_i64_idx * kNumHiddenBytes),
                                  mbarrier_ptr, kNumHiddenBytes);
             }
@@ -897,25 +966,55 @@ dispatch_impl(
              *   布局: sf[token, kNumSFPacks, hidden/kNumSFPacks]
              *   加载 stride: sf_token_stride, sf_hidden_stride
              *
-             *   使用 cp.async 指令进行异步加载
+             *   sf_hidden_stride 通常 = 1 (行优先连续张量, PyTorch 默认),
+             *     此时 gmem 也是连续 load (32 个线程读 32 个相邻 sf_pack)
+             *   参数化设计是为了支持非连续张量 (transpose 视图等)
+             *   对比: 接收端 recv_sf 可能是列优先 (sf_hidden_stride >> 1), 用不同代码路径写回
+             *
+             *   cp_async_ca: PTX 指令 cp.async.ca.shared::cta.global.L2::128B
+             *     - cp.async: 异步拷贝, 发起后线程不等待完成
+             *     - .ca: Cache All, 数据可缓存在 L1+L2
+             *     - .shared::cta → 目标是当前 CTA 的 shared memory
+             *     - .global → 源是 global memory
+             *     - .L2::128B → L2 缓存行 128 字节对齐提示
+             *     - sizeof(dtype_t) 仅支持 4/8/16 字节
+             *
+             *   cp_async_mbarrier_arrive: PTX 指令 cp.async.mbarrier.arrive.shared::cta.b64
+             *     - "预约"语义: 告诉 mbarrier "之前发起的异步拷贝完成后请通知"
+             *     - mbarrier 内部维护计数器, 每个异步拷贝完成时递减, 归零表示全部完成
+             *     - 后续 mbarrier_try_wait 会等待所有异步拷贝真正完成
+             *
+             *   异步加载流程:
+             *     1. cp_async_ca(...)       ← 发起异步拷贝 (不等完成)
+             *     2. cp_async_ca(...)       ← 发起更多异步拷贝
+             *     3. cp_async_mbarrier_arrive ← 注册完成信号
+             *     4. __syncwarp()           ← warp 内同步
+             *     5. (后续) mbarrier_try_wait ← 等所有异步拷贝完成
+             *
+             *   每个 lane 搬 1 个 sf_pack_t 元素, 32 个 lane 一轮共搬 32 个:
+             *     k=0: lane 0→sf_pack[0], lane 1→sf_pack[1], ..., lane 31→sf_pack[31]
+             *     k=1: lane 0→sf_pack[32], lane 1→sf_pack[33], ..., lane 31→sf_pack[63]
+             *     ...
+             *     smem 端连续 store, gmem 端由 sf_hidden_stride 决定 (通常=1, 也连续)
              */
             if constexpr (kNumSFPacks > 0) {
                 EP_STATIC_ASSERT(sizeof(sf_pack_t) % 4 == 0, "SF元素类型未对齐");
                 const auto gmem_src_ptr = math::advance_ptr<sf_pack_t>(sf, token_i64_idx * sf_token_stride * sizeof(sf_pack_t));
                 const auto smem_dst_ptr = tma_buffer.get_sf_ptr();
 
-                // 分批次加载,每批32个元素
+                // 分批次加载,每批32个元素 (每个 lane 搬 1 个 sf_pack_t)
                 constexpr auto kNumFullIters = kNumSFPacks / 32;
                 #pragma unroll
                 for (int k = 0; k < kNumFullIters; ++ k) {
                     ptx::cp_async_ca(gmem_src_ptr + (k * 32 + lane_idx) * sf_hidden_stride,
                                      smem_dst_ptr + k * 32 + lane_idx);
                 }
-                // 处理剩余元素
+                // 处理剩余元素 (只有 lane_idx < 剩余数 的线程工作, 其余空闲)
                 if (kNumFullIters * 32 + lane_idx < kNumSFPacks) {
                     ptx::cp_async_ca(gmem_src_ptr + (kNumFullIters * 32 + lane_idx) * sf_hidden_stride,
                                      smem_dst_ptr + kNumFullIters * 32 + lane_idx);
                 }
+                // 通知 mbarrier: 之前发起的异步拷贝完成后请通知 (预约语义)
                 ptx::cp_async_mbarrier_arrive(mbarrier_ptr);
                 __syncwarp();
             }
@@ -935,6 +1034,7 @@ dispatch_impl(
             if (lane_idx < kNumTopk) {
                 const auto uncasted_dst_expert_idx = __ldg(topk_idx + token_idx * kNumTopk + lane_idx);
                 const auto dst_expert_idx = static_cast<int>(uncasted_dst_expert_idx);
+                // 每个lane记录的不一样的dst_rank_idx
                 stored_dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
 
                 // 写入 TMA buffer 的 metadata
@@ -953,20 +1053,57 @@ dispatch_impl(
              *
              *   编码: src_token_global_idx = rank_idx * kNumMaxTokensPerRank + token_idx
              */
-            if (ptx::elect_one_sync())
+            if (ptx::elect_one_sync())  // elect: 选举一个 lane 写入 metadata
                 *tma_buffer.get_src_token_global_idx_ptr() = rank_idx * kNumMaxTokensPerRank + token_idx;
-            ptx::tma_store_fence();  // 确保在 TMA store 之前写入
+
+            // tma_store_fence: PTX fence.proxy.async.shared::cta
+            //   确保 shared memory 中的写入在 TMA store 发起前对所有 thread 可见
+            ptx::tma_store_fence();
             __syncwarp();
+
+            
 
             /**
              * ==================== 去重 + Slot 分配 ====================
              *
-             *   问题: 同一 token 的多个 top-k 可能选择同一个 rank
-             *   解决: deduplicate + atomicAdd 分配唯一 slot
+             *   核心问题: token 要放到接收方 buffer 的哪个位置?
+             *   每个 rank 有预分配的 recv_buffer, 大小为 kNumMaxTokensPerRank 个 slot
+             *   多个 token 发给同一 rank 时, 必须分配不冲突的 slot 编号
              *
-             *   两种模式:
-             *   1. kReuseSlotIndices = false: 新分配 slot
-             *   2. kReuseSlotIndices = true: 复用 handle 中的 slot (cached handle)
+             *   接收方 (rank 1) 的 recv_buffer 示例:
+             *     slot 0: [token_来自rank0_topk0]
+             *     slot 1: [token_来自rank0_topk2]  ← 不能和 slot 0 冲突
+             *     slot 2: [token_来自rank2_topk1]
+             *     ...
+             *
+             *   为什么需要 deduplicate?
+             *     一个 token 有 kNumTopk 个 top-k 选择, 可能选到同一 rank 的不同 expert:
+             *       token 0 的 top-k: expert 3, expert 5, expert 11
+             *                          ↓        ↓        ↓
+             *                          rank 0   rank 0   rank 1  ← expert 3 和 5 都在 rank 0!
+             *     如果不去重: rank 0 会被发两次同样的 token 0 → 浪费带宽和 slot
+             *     去重后:     rank 0 只发一次 token 0 → 节省资源
+             *
+             *   两种模式的设计动机:
+             *     kReuseSlotIndices = false (新分配): 首次 dispatch, 不知哪些 token 发给哪些 rank,
+             *       用 atomicAdd(counter[rank], 1) 动态分配 slot, 结果写入 dst_buffer_slot_idx 保存
+             *     kReuseSlotIndices = true (复用): 反向 combine 或重复 dispatch, 之前已分配过 slot,
+             *       handle 里保存了 dst_buffer_slot_idx, 直接读取跳过原子操作, 更快
+             *
+             *   典型调用流程:
+             *     前向 dispatch (首次):
+             *       handle = None → kReuseSlotIndices = false
+             *       → atomicAdd 分配 slot
+             *       → 返回 handle (包含 dst_buffer_slot_idx)
+             *     反向 combine / 重复 dispatch:
+             *       handle = 上次的 handle → kReuseSlotIndices = true
+             *       → 直接读取 dst_buffer_slot_idx, 省去原子操作开销
+             *
+             *   dst_buffer_slot_idx 编码:
+             *     全局索引 = rank_idx * kNumMaxTokensPerRank + local_slot_idx
+             *     例: rank 2 的 slot 5 → 全局索引 = 2 * 256 + 5 = 517
+             *     存储: 写全局索引 (便于跨 rank 定位)
+             *     使用: 减去 rank 偏移得到 local_slot_idx (用于 recv_buffer 内偏移)
              *
              *   ┌─────────────────────────────────────────────────────┐
              *   │ 场景: token 0, topk_idx = [3, 11, 19]              │
@@ -982,18 +1119,25 @@ dispatch_impl(
              */
             int stored_dst_slot_idx = -1;
             if constexpr (kReuseSlotIndices) {
-                // 复用模式: 从 dst_buffer_slot_idx 读取
+                // 复用模式: 直接从 handle 中读取之前分配的 slot (跳过原子操作)
                 if (lane_idx < kNumTopk)
                     stored_dst_slot_idx = __ldg(dst_buffer_slot_idx + token_idx * kNumTopk + lane_idx);
-                // 转换为 local slot index (移除 rank 偏移)
+                // 全局索引 → local slot index: 减去 rank 偏移
+                //   例: 全局索引 517 = 2*256+5 → local_slot_idx = 5
                 stored_dst_slot_idx = stored_dst_slot_idx >= 0 ?
                     (stored_dst_slot_idx - rank_idx * kNumMaxTokensPerRank) : -1;
             } else {
-                // 新分配模式: atomicAdd
+                // 新分配模式: 用 atomicAdd 原子递增计数器分配唯一 slot
                 if (ptx::deduplicate(stored_dst_rank_idx, lane_idx) and stored_dst_rank_idx >= 0)
+                    // deduplicate: warp 内按 value 去重, 只让每个唯一值对应的最高 lane 执行
+                    //   实现: match(value) 找相同值的 lane 掩码, get_master_lane_idx 取最高位, 与自身 lane_idx 比较
+                    //   例: lane 0 和 lane 2 都要发 rank 0, 只有 lane 2 (最高位) 执行 atomicAdd
+                    //   atomicAdd 返回旧值作为 slot 编号, 同时计数器+1
+                    //   counter[rank] 初始为 0, 每次 atomicAdd 返回 0,1,2,... 自然递增
                     stored_dst_slot_idx = atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + stored_dst_rank_idx, 1);
 
-                // 写入全局 slot 索引 (用于后续 combine)
+                // 写入全局 slot 索引 (保存到 handle, 供后续 combine 复用)
+                //   local_slot_idx + rank 偏移 → 全局索引
                 if (lane_idx < kNumTopk) {
                     const auto value = stored_dst_slot_idx >= 0 ?
                         rank_idx * kNumMaxTokensPerRank + stored_dst_slot_idx : -1;
@@ -1005,66 +1149,217 @@ dispatch_impl(
             /**
              * ==================== 等待 TMA Load 完成 ====================
              *
-             *   mbarrier 用于确保:
-             *   1. TMA load 数据已到达 smem
-             *   2. 可以安全地执行 TMA store
+             *   完整 TMA + mbarrier 异步流水线 (5 步):
+             *
+             *   步骤1: 初始化  (循环开头)
+             *     elect_one → mbarrier_init(ptr, 1)
+             *     → arrive_count = 1, tx_pending = 0
+             *
+             *   步骤2: 发起 TMA Load  (异步, 立即返回)
+             *     elect_one → tma_load_1d(smem, gmem, mbarrier_ptr, kNumHiddenBytes)
+             *     → TMA 硬件在后台搬运, 完成后自动减少 tx_pending
+             *
+             *   步骤3: Slot 分配  (与 TMA 搬运并行! 关键优化)
+             *     deduplicate + atomicAdd / reuse slot
+             *     → 此时 TMA 硬件还在搬数据, slot 分配零延迟隐藏!
+             *
+             *   步骤4: 注册预期字节数 + 等待  ← 本段代码
+             *     arrive_and_set_tx + wait_and_flip_phase
+             *
+             *   步骤5: 安全使用 smem 数据  (TMA store)
+             *
+             *   ─────────────────────────────────────────────────────
+             *   mbarrier 的两个独立计数器:
+             *
+             *     计数器          初始值             谁修改                     放行条件
+             *     ──────────     ──────────        ──────────────             ──────────
+             *     arrive_count   init 时设为 1      arrive / arrive_and_set_tx 递减到 0
+             *     tx_pending     0                  expect_tx 递增,            递减到 0
+             *                                        TMA 完成时硬件递减
+             *
+             *   mbarrier 放行条件 = (arrive_count == 0) AND (tx_pending == 0)
+             *   两者缺一不可, 分别跟踪 "软件就绪" 和 "硬件就绪"
+             *
+             *   本段代码的精确效果:
+             *     mbarrier_arrive_and_set_tx(ptr, kNumHiddenBytes):
+             *       → arrive_count -= 1  (1→0 ✅ 软件到达条件满足)
+             *       → tx_pending += kNumHiddenBytes  (0→kNumHiddenBytes)
+             *       → 此时 tx_pending > 0, 还不能放行
+             *     mbarrier_wait_and_flip_phase(ptr, phase):
+             *       → 自旋等待直到 arrive_count==0 AND tx_pending==0
+             *       → TMA 硬件每搬完一个字节 tx_pending 减 1
+             *       → 全部搬完 tx_pending 归零, 两个条件均满足, 放行!
+             *       → phase 翻转 (0→1 或 1→0), 避免与下一轮混淆
+             *
+             *   为什么 arrive_and_set_tx 放在 slot 分配之后?
+             *     顺序执行: 总时间 = TMA延迟 + slot分配时间
+             *     并行执行: 总时间 ≈ max(TMA延迟, slot分配时间)
+             *     arrive_and_set_tx 是 "注册预期", 注册后才开始等,
+             *     把它推迟到 slot 分配之后, TMA 有更多时间在后台完成搬运
+             *
+             *   phase 的作用:
+             *     每轮 wait 通过后 phase 翻转 (0↔1), 下一轮等待新相位
+             *     防止上一轮的残留信号干扰当前轮的等待判断
              */
-            if (ptx::elect_one_sync()) {
+            if (ptx::elect_one_sync()) {  // elect: 选举一个 lane 管理 mbarrier
+                // mbarrier_arrive_and_set_tx: PTX mbarrier.arrive.expect_tx
+                //   arrive_count -= 1 (软件到达), tx_pending += kNumHiddenBytes (注册预期字节数)
                 ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                // mbarrier_wait_and_flip_phase: PTX mbarrier.try_wait.parity (自旋等待)
+                //   自旋等待 arrive_count==0 AND tx_pending==0, 通过后翻转 phase
                 ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
             }
             __syncwarp();
 
             /**
-             * ==================== NVLink TMA Store ====================
+             * ==================== 数据发送: NVLink 直写 / RDMA ====================
              *
-             *   通过 NVLink 发送数据到本地或其他节点
-             *   使用 Gin 的对称内存指针获取目标地址
+             *   ─────────────────────────────────────────────────────
+             *   TMA Load vs TMA Store 完成通知机制对比:
              *
-             *   地址计算:
-             *   recv_buffer.get_token_buffer(slot).get_base_ptr()
-             *   相对于目标 rank 的偏移
+             *                    TMA Load                         TMA Store
+             *                    ─────────                       ──────────
+             *   方向             global → shared                 shared → global
+             *   PTX指令          ...mbarrier::complete_tx::bytes ...bulk_group
+             *   完成通知         mbarrier (按字节跟踪)            bulk_group (按请求个数排队)
+             *   参数             dst, src, mbarrier, bytes       dst, src, bytes
+             *
+             *   TMA Load 通知链:
+             *     tma_load_1d(smem, gmem, mbarrier, bytes)
+             *       → TMA 硬件搬完后自动: mbarrier.tx_pending -= bytes
+             *     arrive_and_set_tx(mbarrier, bytes)
+             *       → arrive_count--, tx_pending += bytes
+             *     wait_and_flip_phase(mbarrier, phase)
+             *       → 自旋等到 tx_pending==0 (所有字节到位)
+             *
+             *   TMA Store 通知链:
+             *     tma_store_1d(gmem, smem, bytes)
+             *       → 请求进入 bulk_group 队列 (FIFO, 按程序顺序)
+             *     tma_store_commit()
+             *       → PTX: cp.async.bulk.commit_group, 提交当前队列
+             *     tma_store_wait<N>()
+             *       → PTX: cp.async.bulk.wait_group N
+             *       → 等到队列中最多剩 N 个未完成请求
+             *       → N=0: 全部完成; N=1: 允许1个overlap (流水线优化)
+             *
+             *   为什么设计不同?
+             *     TMA Load 后要立即使用 smem 数据, 必须等全部字节到位 → 按字节精确跟踪
+             *     TMA Store 只需知道"请求完没完", 不关心字节数 → 按请求个数排队
+             *
+             *   bulk_group 队列是顺序的吗?
+             *     是的, FIFO (先入先出), 按程序提交顺序执行和完成
+             *     commit_group 提交后, 同一组内的请求保证按序完成
+             *     不同 commit_group 之间也保证顺序: 第 N 组全部完成后, 第 N+1 组才开始完成
+             *   ─────────────────────────────────────────────────────
+             *
+             *   两种发送路径 (互斥, 由 kIsScaleupNVLink 编译期决定):
+             *
+             *   ┌─────────────────────────────────────────────────────────────┐
+             *   │  路径A: RDMA 模式 (not kIsScaleupNVLink, 跨节点通信)        │
+             *   │                                                             │
+             *   │  smem ──TMA store──→ send_buffer (本地 gmem)                │
+             *   │                          │                                  │
+             *   │              ┌───────────┴───────────┐                      │
+             *   │              │                       │                      │
+             *   │     NVLink 可达?               NVLink 不可达?               │
+             *   │     (dst_ptr != nullptr)       (dst_ptr == nullptr)         │
+             *   │              │                       │                      │
+             *   │     TMA store 直写             gin.put (RDMA)               │
+             *   │     对端 recv_buffer           对端 recv_buffer             │
+             *   └─────────────────────────────────────────────────────────────┘
+             *                                                             │
+             *   ┌─────────────────────────────────────────────────────────────┐
+             *   │  路径B: 纯 NVLink 模式 (kIsScaleupNVLink, 节点内通信)       │
+             *   │                                                             │
+             *   │  smem ──TMA store──→ 对端 recv_buffer (NVLink 直写)         │
+             *   │  无 send_buffer 中转, 无 RDMA                               │
+             *   └─────────────────────────────────────────────────────────────┘
+             *
+             *   为什么 RDMA 模式需要 send_buffer 中转?
+             *     RDMA (gin.put) 从 global memory 读取源数据,
+             *     无法直接从 smem 读取, 所以必须先把 smem 数据 TMA store 到 send_buffer
              */
             auto send_buffer_ptr = send_buffer.get_token_buffer(token_idx).get_base_ptr();
             if constexpr (not kIsScaleupNVLink) {
-                // RDMA 模式: 先存储到 send buffer (RDMA 会读取这个 buffer)
-                if (ptx::elect_one_sync())
+                // RDMA 模式步骤1: smem → send_buffer (本地 gmem)
+                //   RDMA 引擎只能读 gmem, 所以需要先把 smem 数据搬出来
+                if (ptx::elect_one_sync())  // elect: 选举一个 lane 执行 TMA store
+                
+                    // tma_store_1d: PTX cp.async.bulk.global.shared::cta.bulk_group
+                    //   TMA 硬件加速的 1D 批量异步存储: shared→global, 加入 bulk_group 队列
+                    //   参数: gmem_dst(send_buffer), smem_src(tma_buffer), num_bytes
                     ptx::tma_store_1d(send_buffer_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+
+                // tma_store_commit: PTX cp.async.bulk.commit_group
+                //   将当前 bulk_group 中的 TMA store 请求提交执行
                 ptx::tma_store_commit();
+
                 __syncwarp();
             }
 
-            // ========== NVLink 发送 ==========
+            // ========== NVLink 直写 ==========
             EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid top-k selection");
 
-            // 获取目标地址 (gin.get_sym_ptr 返回对称内存地址)
+            // 获取目标地址 (gin.get_sym_ptr 返回对端对称内存地址)
+            //   同一节点内: 返回对端 rank 的 recv_buffer 指针 (NVLink 可达)
+            //   跨节点: 返回 nullptr (NVLink 不可达, 需要 RDMA)
             const auto dst_ptr = stored_dst_slot_idx >= 0 ?
                 gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
                 nullptr;
 
-            // 执行 TMA store (如果 dst_ptr != nullptr, 即目标可达)
+            // NVLink 可达时: smem 直写到对端 recv_buffer (零拷贝)
+            // tma_store_1d: PTX cp.async.bulk.global.shared::cta.bulk_group
+            //   TMA 硬件加速的 1D 批量异步存储: shared→global (NVLink 直写对端对称内存)
+            //
+            //   注意: 这里没有用 elect_one_sync(), 是多个 lane 独立发起 TMA store,
+            //   但不会重复写入! 因为 deduplicate 已经保证每个目标 rank 只有一个 lane 拥有有效 slot:
+            //     例: token 0 的 top-k → [rank 0, rank 0, rank 1]
+            //       lane 0: stored_dst_rank_idx=0, slot 有效 → dst_ptr ≠ nullptr → 发 TMA store 到 rank 0
+            //       lane 1: stored_dst_rank_idx=0, slot=-1  (被 deduplicate 掉) → dst_ptr = nullptr → 不发
+            //       lane 2: stored_dst_rank_idx=1, slot 有效 → dst_ptr ≠ nullptr → 发 TMA store 到 rank 1
+            //       lane 3~31: slot=-1 → dst_ptr = nullptr → 不发
+            //   每个 lane 写到不同的 dst_ptr (不同 rank), 同一个 tma_buffer 数据复制到多个目标
+            //   这正是期望的行为: 一个 token 发给多个 rank (一对多)
+            //
+            //   对比 RDMA 路径 (line 1219) 用 elect_one_sync(): 那里只写一个 send_buffer_ptr
+            //   (单一目标), 只需一个 lane 执行; 而这里需要多个 lane 各自发往不同 rank
             if (dst_ptr != nullptr)
                 ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+            // tma_store_commit: PTX cp.async.bulk.commit_group, 提交当前 bulk_group
+            //   所有 lane 都参与 commit, 保证之前所有 TMA store 请求都被提交
             ptx::tma_store_commit();
             __syncwarp();
 
             /**
-             * ==================== RDMA Put ====================
+             * ==================== RDMA Put (跨节点) ====================
              *
-             *   对于非 NVLink 可达的 rank (跨节点), 使用 RDMA 发送
+             *   仅 RDMA 模式 (not kIsScaleupNVLink) 需要
+             *   对 NVLink 不可达的 rank, 使用 gin.put 做 RDMA 发送
              *
              *   条件:
              *   - stored_dst_slot_idx >= 0: 有效 slot
-             *   - dst_ptr == nullptr: NVLink 不可达,需要 RDMA
+             *   - dst_ptr == nullptr: NVLink 不可达
              *
-             *   数据来源: send_buffer (在前面 TMA store 时写入)
+             *   数据来源: send_buffer (在前面 smem→send_buffer 的 TMA store 中写入)
              */
             if constexpr (not kIsScaleupNVLink) {
                 // 等待 send buffer TMA store 完成
+                // tma_store_wait<1>: PTX cp.async.bulk.wait_group, 参数1=等待直到最多1个pending
+                //   (确保 send_buffer 写入完成后再 RDMA 读取, 否则 RDMA 读到未完成的数据)
                 ptx::tma_store_wait<1>();
                 __syncwarp();
 
-                // 跨节点 RDMA 发送
+                // 跨节点 RDMA 发送: send_buffer → 对端 recv_buffer
+                //   条件: stored_dst_slot_idx >= 0 (有效 slot) AND dst_ptr == nullptr (NVLink 不可达)
+                //
+                //   和 NVLink 直写一样, 这里也是多 lane 独立发起 RDMA, 不会重复:
+                //     例: token 0 的 top-k → [rank 0(同节点), rank 0(同节点,被dedup), rank 5(跨节点)]
+                //       lane 0: slot有效, dst_ptr≠nullptr → 走上面的 NVLink 直写
+                //       lane 1: slot=-1 (deduplicate) → 不发
+                //       lane 2: slot有效, dst_ptr==nullptr → 走 RDMA (gin.put 到 rank 5)
+                //
+                //   多个 lane 可能从同一份 send_buffer_ptr 读数据 gin.put 到不同目标 rank,
+                //   这是合法的: gin.put 只读源数据, 不会修改, 多个 lane 并行读不冲突
                 if (stored_dst_slot_idx >= 0 and dst_ptr == nullptr) {
                     gin.put<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
                                     send_buffer_ptr, tma_buffer.get_num_bytes<false>(), stored_dst_rank_idx);
@@ -1075,14 +1370,27 @@ dispatch_impl(
     }
 
     /**
-     * ==================== 网格同步 Barrier ====================
+     * ==================== 结束后 Barrier ====================
      *
-     *   确保所有 SM 都完成数据发送
-     *   参数:
-     *   - comm::kDispatchTag1: 区分不同阶段的 barrier
-     *   - true: prologue grid sync (等待所有 SM)
-     *   - true: epilogue grid sync (确保数据可见)
-     *   - false: 不 flush TMA store (由下一个 barrier 处理)
+     *   确保所有 SM 都完成数据发送, 所有 TMA store 数据落盘
+     *
+     *   与开始前 barrier (kDispatchTag0) 对比:
+     *
+     *   模板参数                开始前 (Tag0)     结束后 (Tag1)     含义
+     *   ──────────────────     ────────────     ────────────     ──────────
+     *   kTag                   kDispatchTag0    kDispatchTag1    不同阶段,互不干扰
+     *   kFlushStores           false            true             开始前没数据不用flush;
+     *                                                            结束后必须flush (等TMA store全部完成)
+     *   kSyncAtStart           false            true             开始前各自跑不用sync;
+     *                                                            结束后必须sync (等所有SM都干完再barrier)
+     *   kSyncAtEnd             true             false            开始后等所有SM一起开工;
+     *                                                            结束后不用等 (后面有其他同步机制)
+     *
+     *   gpu_barrier 内部流程 (kFlushStores=true, kSyncAtStart=true):
+     *     1. kFlushStores: tma_store_commit + tma_store_wait → 确保所有 TMA store 数据落盘
+     *     2. kSyncAtStart: cooperative_groups::this_grid().sync() → 等所有 SM 到齐
+     *     3. scaleup_barrier: NVLink/RDMA barrier → 跨 rank 同步 (确保对端收到数据)
+     *     4. kSyncAtEnd=false: 不做额外 grid sync (直接返回)
      */
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag1, true, true, false>(
