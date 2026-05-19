@@ -405,7 +405,11 @@ hybrid_dispatch_impl(
 
                 // 当前节点的nvl rank i的累加值算好了，
                 // ⚠️ 高 32 位是 scaleup rank 总数（用于对端判断是否收齐），低 32 位是聚合后的 token 计数
-                // ⚠️ 接收方阻塞等待 高32位 == kNumRanks, 就意味着该数可用了
+                // ⚠️ 接收方阻塞等待 高32位 == kNumScaleupRanks, 就意味着该数可用了
+                // 🔑 高32位编码对比 (Step 6a vs 6b):
+                //   6a rank_count:  put_value 直接写 → 每个 scaleup rank 写不同偏移 → 高32位一次性写 kNumScaleupRanks (就绪标记)
+                //   6b expert_count: red_add 原子加 → 所有 scaleup rank 写同一位置 → 高32位每次+1, 收齐后累加 == kNumScaleupRanks
+                //   殊途同归: 接收方都等 高32位 == kNumScaleupRanks 即可读
                 const int64_t counter = (static_cast<int64_t>(kNumScaleupRanks) << 32ll) | count;
 
                 // ncclTeamTagLsa 就是 NVLink 通信的 tag
@@ -434,6 +438,7 @@ hybrid_dispatch_impl(
                 //   red_add_rel: 原子加 + release 语义 (保证对端可见)
                 //   counter 高 32 位=1 (表示1个 scaleup rank 的贡献)
                 //   dst_scaleup_rank_idx: expert i 所属的 scaleup rank
+                // ⚠️ 接收方阻塞等待 高32位 == kNumScaleupRanks, 就意味着该数可用了
                 const int64_t counter = (1ll << 32ll) | count;
                 const auto dst_scaleup_rank_idx = i / kNumExpertsPerRank;
                 const auto expert_idx_in_dst_rank = i % kNumExpertsPerRank;
@@ -459,7 +464,7 @@ hybrid_dispatch_impl(
             comm::timeout_while<kNumTimeoutCycles>(thread_idx < kNumScaleupRanks + kNumExpertsPerRank,
                 [&](const bool& is_last_check) {
                 const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + thread_idx);
-                if ((status >> 32ull) == kNumScaleupRanks) {
+                if ((status >> 32ull) == kNumScaleupRanks) { // 高32位 == kNumScaleupRanks
                     const auto count = static_cast<int>(status & 0xffffffffll);
                     // rank 计数不需要对齐, expert 计数按 kExpertAlignment 对齐
                     //   对齐原因: expand 模式下输出张量按 expert alignment 分配行号
