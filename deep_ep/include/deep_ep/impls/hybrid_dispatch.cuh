@@ -309,6 +309,7 @@ hybrid_dispatch_impl(
                     if ((status >> 32) == kNumSMs) {
                         // encode_decode_positive: 编码为特殊格式 (0→无效, 正数→2*val+1)
                         //   避免 RDMA 写的 "0 值" 与 "未写入" 混淆
+                        // ⚠️ 这里写入scaleout的send buffer
                         workspace_layout.get_scaleout_rank_expert_count_ptr<true>()[i] =
                             math::encode_decode_positive<int>(status & 0xffffffffll);
 
@@ -346,11 +347,13 @@ hybrid_dispatch_impl(
                 gin.put<ncclTeamTagRail>(
                     workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),  //recv_sym_ptr：远端接收区地址 → dst
                     workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),//send_sym_ptr：本地发送区地址 → src
+                    // 发送 kNumScaleupRanks 个数据
                     kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx,
                     ncclGinOptFlagsAggregateRequests);
                 gin.put<ncclTeamTagRail>(
                     workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
                     workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
+                    // 发送 kNumExpertsPerScaleout 个数据
                     kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx);
             }
             __syncwarp();
@@ -465,7 +468,9 @@ hybrid_dispatch_impl(
                 [&](const bool& is_last_check) {
                 const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + thread_idx);
                 if ((status >> 32ull) == kNumScaleupRanks) { // 高32位 == kNumScaleupRanks
+                    // status 低 32 位 = 计数值
                     const auto count = static_cast<int>(status & 0xffffffffll);
+
                     // rank 计数不需要对齐, expert 计数按 kExpertAlignment 对齐
                     //   对齐原因: expand 模式下输出张量按 expert alignment 分配行号
                     const auto aligned_count = math::align<int>(
@@ -476,14 +481,16 @@ hybrid_dispatch_impl(
                     // CPU 同步模式: 写入 host workspace 供 CPU 读取
                     if constexpr (kDoCPUSync) {
                         host_workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[thread_idx] =
+                            // host也要轮询等待device端写入
                             math::encode_decode_positive(aligned_count);
                     }
 
-                    // 累计统计 (供外部监控)
+                    // 只累计统计各个expert的token数 (供外部监控)
                     if (cumulative_local_expert_recv_stats != nullptr and thread_idx >= kNumScaleupRanks)
                         atomicAdd(cumulative_local_expert_recv_stats + (thread_idx - kNumScaleupRanks), count);
 
                     // 保存到 smem, 供后续 prefix sum 使用
+                    // ⚠️ 此时已经是对齐之后的值了
                     rank_expert_count[thread_idx] = aligned_count;
                     return true;
                 }
@@ -499,15 +506,39 @@ hybrid_dispatch_impl(
             });
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
+
             // Step 8: 计算 prefix sum
             //   warp 0: inclusive psum of rank_count → psum_num_recv_tokens_per_scaleup_rank
             //     供 epilogue 定位每段 scaleup rank 边界
             //   warp 1: exclusive psum of expert_count → psum_num_recv_tokens_per_expert
             //     供 epilogue expand 模式分配行号 (exclusive 是因为 atomicAdd 从0开始)
             //
-            //   实现: 手动 warp inclusive sum + 跨迭代 carry (psum)
-            //     每 32 个元素一批: warp_inclusive_sum 算出批内前缀和
-            //     exchange(sum, 31): 取 batch 最后一个 lane 的值作为下一批的 carry
+            //   原语说明:
+            //     warp_inclusive_sum(value, lane_idx):
+            //       warp 内 inclusive prefix sum, 每个 lane 输入 value, 输出 lane0..lane_idx 的累加和
+            //       例: 输入 [3,1,4,2] → 输出 [3,4,8,10]
+            //     exchange(sum, 31):
+            //       从 lane 31 广播 sum 到所有 lane, 即获取整批总和, 作为下一批的 carry
+            //
+            //   分段算法 (n 可能 > 32):
+            //     每批 32 元素, 由 warp_inclusive_sum 算批内前缀和
+            //     psum (carry) 保存前一批的总和, 加到本批每个结果上
+            //     exchange(sum, 31) 取 lane31 的 sum = psum + 本批总和, 作为下一批 carry
+            //
+            //   Inclusive 例子 (is_exclusive=0, count=[3,1,4,2,5,7,6], n=7):
+            //     批0: value=[3,1,4,2,5,7,6,0..], psum=0
+            //       warp_inclusive_sum → [3,4,8,10,15,22,28,28..]
+            //       sum = 0 + [3,4,8,10,15,22,28,28..] = [3,4,8,10,15,22,28,28..]
+            //       out = [3,4,8,10,15,22,28] ✓
+            //       psum = exchange(sum,31) = 28
+            //
+            //   Exclusive 例子 (is_exclusive=1, count=[3,1,4,2,5,7,6], n=7):
+            //     巧妙偏移: idx=lane_idx, mem_idx=idx-1, value=count[mem_idx]
+            //       lane 0 读 count[-1]→0, lane 1 读 count[0]→3, lane 2 读 count[1]→1, ...
+            //     批0: value=[0,3,1,4,2,5,7,6,0..], psum=0
+            //       warp_inclusive_sum → [0,3,4,8,10,15,22,28,28..]
+            //       sum = 0 + [0,3,4,8,10,15,22,28,28..]
+            //       out = [0,3,4,8,10,15,22,28] ✓ (输出比输入多一个元素)
             const auto do_psum = [=](const int* count, int* out, const int n, const int is_exclusive) {
                 int psum = 0;
                 #pragma unroll
@@ -523,6 +554,7 @@ hybrid_dispatch_impl(
                     psum = ptx::exchange(sum, 31);
                 }
             };
+
             if (warp_idx == 0) {
                 // Inclusive prefix sum
                 do_psum(rank_count, psum_num_recv_tokens_per_scaleup_rank, kNumScaleupRanks, 0);
