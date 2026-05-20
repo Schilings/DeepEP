@@ -365,6 +365,8 @@ __device__ __forceinline__ int reduce_add(const int& value) {
     return __reduce_add_sync(0xffffffff, value);
 }
 
+// 🔑 __match_any_sync: 返回 warp 内所有与 value 相同的 lane 组成的 bitmask
+//   例: lane 3,5,9 的 value 都是 7 → 返回 0b...0010_0100_1000
 __device__ __forceinline__ unsigned match(const int& value) {
     return __match_any_sync(0xffffffff, value);
 }
@@ -383,6 +385,9 @@ __device__ __forceinline__ auto ffs(const dtype_t& value) {
     }
 }
 
+// 🔑 找 bitmask 中最高位 1 的位置 (即编号最大的 lane)，作为 "master lane"
+//   bfind.u32: PTX 指令，返回最高位 1 的 bit 位置
+//   等价于 31 - __clz(mask)
 __device__ __forceinline__ int get_master_lane_idx(const unsigned& mask) {
     // Equivalent to `31 - __clz(mask)`
     int highest_idx;
@@ -390,6 +395,9 @@ __device__ __forceinline__ int get_master_lane_idx(const unsigned& mask) {
     return highest_idx;
 }
 
+// 🔑 去重: 同一 value 的多个 lane 中，只有 master lane (编号最大) 返回 true
+//   流程: match(value) 找同值 lane → get_master_lane_idx 选最高位 → 与当前 lane 比较
+//   效果: 相同目标 rank 的多个 lane 中，只选一个代表去分配 slot，避免重复分配
 __device__ __forceinline__ bool deduplicate(const int& value, const int& lane_idx) {
     return get_master_lane_idx(match(value)) == lane_idx;
 }
