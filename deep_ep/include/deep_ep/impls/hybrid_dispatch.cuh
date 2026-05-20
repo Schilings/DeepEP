@@ -239,6 +239,8 @@ hybrid_dispatch_impl(
         token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
     auto scaleout_send_buffer = layout::BufferLayout<false>(
         token_layout, 1, kNumMaxTokensPerRank, scaleup_buffer.get_buffer_end_ptr());
+    // ⚠️  kNumMaxTokensPerChannel = ceil_div(kNumMaxTokensPerRank, kNumChannels)
+    // ⚠️ 近似 kNumMaxTokensPerRank <= kNumMaxTokensPerChannel * kNumChannels
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         token_layout, kNumScaleoutRanks, kNumChannels * kNumMaxTokensPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
@@ -250,17 +252,20 @@ hybrid_dispatch_impl(
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
     __syncwarp();
 
-    // ==================== Phase 1: Notify Warps ====================
-    // 职责: 统计每个 rank/expert 应收多少 token, 跨节点聚合, 计算 prefix sum
-    //
-    // 流程:
-    //   Step 1: 本 SM 内统计 rank/expert 计数 → smem
-    //   Step 2: 全 grid reduction → workspace (跨 SM 聚合)
-    //   Step 3: SM0 跨节点发送计数 → RDMA put 到其他节点
-    //   Step 4: SM0 接收其他节点计数 + 节点内聚合 → NVLink 写到对端 rank
-    //   Step 5: SM0 等待本地计数就绪 → 计算 prefix sum
-    //
+
     if (warp_idx < kNumNotifyWarps) {
+
+        // ==================== Phase 1: Notify Warps ====================
+        // 职责: 统计每个 rank/expert 应收多少 token, 跨节点聚合, 计算 prefix sum
+        //
+        // 流程:
+        //   Step 1: 本 SM 内统计 rank/expert 计数 → smem
+        //   Step 2: 全 grid reduction → workspace (跨 SM 聚合)
+        //   Step 3: SM0 跨节点发送计数 → RDMA put 到其他节点
+        //   Step 4: SM0 接收其他节点计数 + 节点内聚合 → NVLink 写到对端 rank
+        //   Step 5: SM0 等待本地计数就绪 → 计算 prefix sum
+        //
+
         // smem 前 kNumRanks+kNumExperts 个 int 用于本地计数
         //   [0..kNumRanks-1]: rank_count (每个 rank 收到多少 token)
         //   [kNumRanks..kNumRanks+kNumExperts-1]: expert_count (每个 expert 收到多少 token)
@@ -624,6 +629,7 @@ hybrid_dispatch_impl(
                 // ⚠️ 当前新的tail状态
                 const auto signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
                 // ⚠️ 本channel的signaled区域，用于通信signale
+                // ⚠️ 诶，好像跟DeepEPv1相比，不用去考虑接收方的消费进度诶
                 const auto ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
                 // ⚠️ 上次旧的tail状态
                 const auto old_signaled_tail = math::pack2<int, int64_t>(0, stored_old_scaleout_tail);
@@ -708,9 +714,8 @@ hybrid_dispatch_impl(
             // ⚠️ 写入源 metadata: rank_idx * kNumMaxTokensPerRank + token_idx
             //   供 epilogue/combine 识别 token 来源
             //   编码方式: 高位是 rank, 低位是 token 在 rank 内的序号
-            // ⚠️ 这里也可以看出 kNumMaxTokensPerChannel = ceil_div(kNumMaxTokensPerRank, kNumChannels)
-           // ⚠️ 近似 kNumMaxTokensPerRank = kNumMaxTokensPerChannel * kNumChannels
-           // 🌟🌟🌟 这里记的应该是这个token会发在send buffer的哪个位置，到时候返回来的时候就放在resv buffer的这个位置？？？
+           // 🌟🌟🌟 这里记的应该是这个token的全局idx，rank_idx是全局rank id。
+           //          发送源 recv_buffer 近似于 [num_ranks][kNumMaxTokensPerRank],
             if (ptx::elect_one_sync())
                 *tma_buffer.get_src_token_global_idx_ptr() = rank_idx * kNumMaxTokensPerRank + token_idx;
             
@@ -808,7 +813,6 @@ hybrid_dispatch_impl(
 
     } else {
 
-            
         // ==================== Phase 3: Forward Warps (节点内 NVLink 转发) ====================
         // 职责: 从 recv_buffer 读取跨节点来的 token → 通过 NVLink 转发到同节点其他 rank
         //
@@ -829,23 +833,20 @@ hybrid_dispatch_impl(
         //
         // 每个 forward warp = 一个 channel (与 scaleout warp 一一对应)
         //   对端 scaleout warp 写入 recv_buffer → 本 forward warp 读出并转发
-        //
-        // Channel 映射:
-        //   forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps)
-        //   channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx
-        //   与 scaleout warp 的 channel_idx 计算方式相同, 保证一一对应
 
+        // Channel 映射: 与 scaleout warp 的 channel_idx 计算方式相同, 保证一一对应
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
         const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
-        // recv_buffer: 只看本 channel 的数据 (跨所有 scaleout rank)
+        // 📌recv_buffer: 只看本 channel 的数据 (跨所有 scaleout rank)
         //   与 scaleout 不同: scaleout 只看本 rank 的本 channel, forward 看所有 rank 的本 channel
         //   因为 forward 需要轮询所有 scaleout rank 发来的数据
+        // ⚠️ 定位到这个channel, 动态定位到不同的scaleout rank
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
-        // scaleup_buffer: 本 scaleup rank 的接收区 (NVLink 直写目标)
+        // 📌scaleup_buffer: 本 scaleup rank 的接收区 (NVLink 直写目标)
         //   对端 rank 通过 NVLink TMA store 直写到这个 buffer 的 slot 中
         scaleup_buffer = scaleup_buffer.get_rank_buffer(scaleup_rank_idx);
 
-        // ---------- Metadata 布局 ----------
+        // ----------📌 Metadata 布局 ----------
         // token_metadata_at_forward: 全局形状 [kNumChannels][kNumScaleoutRanks * kNumMaxTokensPerChannel + 1][kNumForwardMetadataDims]
         //   +1: 末尾的结束标记 (-1)
         //   每个 channel 的 forward warp 独占一段, 无需跨 channel 同步
@@ -856,16 +857,18 @@ hybrid_dispatch_impl(
         //     [2+topk..2+2*topk-1]: stored_dst_slot_idx   — 每个 top-k 选择在 scaleup_buffer 中的 slot 编号
         //   供 combine 反向路径使用: 从 scaleup_buffer 读回数据时, 知道每个 token 来自哪个 rank/slot
         constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
+        // ⚠️ 定位到这个channel
         token_metadata_at_forward += channel_idx * ((kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumForwardMetadataDims);
 
-        // dst_buffer_slot_idx: 全局形状 [kNumChannels, kNumScaleoutRanks, kNumMaxTokensPerChannel, kNumTopk]
+        // 📌dst_buffer_slot_idx: 全局形状 [kNumChannels, kNumScaleoutRanks, kNumMaxTokensPerChannel, kNumTopk]
         //   记录每个 (channel, scaleout_rank, slot, topk_idx) 的目标 slot 编号
-        //   kReuseSlotIndices 模式下, 后续 combine 直接从这里读取 slot, 无需重新计算
+        // ⚠️ kReuseSlotIndices 模式下, 后续 combine 直接从这里读取 slot, 无需重新计算
+        // ⚠️ 定位到这个channel
         dst_buffer_slot_idx += channel_idx * (kNumScaleoutRanks * kNumMaxTokensPerChannel * kNumTopk);
 
-        // ---------- Linked list 索引变换 ----------
+        // ---------- 📌Linked list 索引变换 ----------
         // 将逻辑 linked list 索引 → 全局物理索引
-        //   全局布局: [kNumChannels][kNumTokensInLinkedList][kNumScaleupRanks]
+        //  ⚠️  全局布局: [kNumChannels][kNumTokensInLinkedList][kNumScaleupRanks] = [kNumChannels][kNumMaxTokensPerChannel * kNumScaleoutRanks + 1][kNumScaleupRanks]
         //     - channel_idx: 本 channel 在全局中的偏移
         //     - idx * kNumScaleupRanks + scaleup_rank_idx: 在 linked list 中的位置
         //   +1 是给 tail 节点 (哨兵) 用的, kNumTokensInLinkedList = kNumMaxTokensPerChannel * kNumScaleoutRanks + 1
@@ -875,8 +878,8 @@ hybrid_dispatch_impl(
         //     → 本 channel 的第 5 个 linked list 节点中, 属于 scaleup rank 3 的位置
         const auto transform_linked_list_idx = [=](const int& idx) {
             constexpr int kNumTokensInLinkedList = kNumMaxTokensPerChannel * kNumScaleoutRanks + 1;
-            return channel_idx * (kNumTokensInLinkedList * kNumScaleupRanks) +
-                idx * kNumScaleupRanks + scaleup_rank_idx;
+            // ⚠️ 写死，定位好了 channel_idx，scaleup_rank_idx ==> (channel_idx, idx ,scaleup_rank_idx)
+            return channel_idx * (kNumTokensInLinkedList * kNumScaleupRanks) + idx * kNumScaleupRanks + scaleup_rank_idx;
         };
 
         // ==================== Forward 主循环 ====================
@@ -895,29 +898,72 @@ hybrid_dispatch_impl(
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Too many scale-out ranks");
         int num_tokens_processed = 0;
         int stored_scaleout_old_tail_idx = 0;   // per lane: 本 rank 已处理的 slot 上界
-        int stored_scaleup_send_counters[kNumScaleupRanksPerLane] = {};  // per lane: 向各 scaleup rank 发送的计数 (用于 linked list)
-        int stored_finish_flag = lane_idx >= kNumScaleoutRanks;  // per lane: 本 rank 是否已完成 (>0=finish, 0=not yet)
         int stored_scaleout_tail_idx = 0;       // per lane: 本 rank 的最新 tail (从 signaled_tail 解码)
-        int recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks;  // 当前轮询的 scaleout rank
+        int stored_finish_flag = lane_idx >= kNumScaleoutRanks;  // per lane: 本 rank 是否已完成 (>0=finish, 0=not yet)
+        
+        // ⚠️ ScaleupRanks分批 [0~31],[32~63],...，
+        // ⚠️ 32个lane，每个lane所持有的信息不同，lane0持有[0,32,..],lane1持有[1,33,..]
+        // ⚠️ 此刻，32个lane负责发送到多个expert，每个lane的目标scaleup rank可能相同可能不同
+        // ⚠️ 找到目标scaleup rank的信息存在于哪个lane内 ==> 在其批次的相对索引，也就是lane的索引
+        // 📌 per lane: 向该lane持有的 scaleup rank 发送的计数 (用于 linked list)，lane0持有[0,32,..],lane1持有[1,33,..]
+        // 📌 本质就是，stored_scaleup_send_counters的数据分摊在每个lane
+        int stored_scaleup_send_counters[kNumScaleupRanksPerLane] = {};  
 
-        // wip_mask: "work in progress" 位掩码
+
+         // ⚠️ 当前轮询的 scaleout rank，每个warp都轮序所有scaleout rank，只不过轮序的begin不一样
+        int recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks; 
+
+        // ⚠️wip_mask: "work in progress" 位掩码
         //   每个 lane 贡献 1 bit: (stored_scaleout_tail_idx > stored_scaleout_old_tail_idx) or (stored_finish_flag == 0)
         //   即: 该 lane 对应的 rank 有新数据, 或还没结束
         //   gather: 将所有 lane 的 bit 收集到一个 uint32_t
         //   wip_mask != 0 表示还有工作要做
         uint32_t wip_mask;
+
+        // ⚠️ 每个 lane 维护自己对应 scaleout rank 的状态：
+        // stored_scaleout_old_tail_idx：已处理到哪个 slot
+        // stored_scaleout_tail_idx：最新到达的 tail
+        // stored_finish_flag：该 rank 是否发完
+        // ⚠️ 退出条件是 wip_mask == 0，即每个 lane 都满足：
+        //      stored_scaleout_tail_idx <= stored_scaleout_old_tail_idx（没新数据了）且
+        //      stored_finish_flag != 0（该 rank 已发完）
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
-            // ---------- Round-Robin 选择下一个有数据的 scaleout rank ----------
-            // 从上次处理的 rank 的下一个开始找, 避免总是从 rank 0 开始
+
+            // ---------- ⚠️ Round-Robin 选择下一个有数据的 scaleout rank ----------
+            // 📌从上次处理的 rank 的下一个开始找, 避免总是从 rank 0 开始
             //   offset = (上次 rank + 1) % kNumScaleoutRanks
-            //   hi_mask: offset 之后的位 (高位部分)
+            //   hi_mask: offset 之后的位 (高位部分) 相当于，把offset个低位抹为零，先不考虑 rank0-rank4，若rank5-xx没数据，再考虑rank0-4
             //   如果 hi_mask 非零 → 找到高位第一个 1 (ffs)
             //   否则 → 从低位开始找 (wrap-around)
+            //
+            // 📌 举例: kNumScaleoutRanks=8, wip_mask=0b10110010 (rank 1,4,5,7 有工作)
+            //   上次 rank=4 → offset=5, hi_mask=(0b10110010>>5)<<5=0b10100000 → ffs=5 → 选 rank 5
+            //   上次 rank=5 → offset=6, hi_mask=(0b10110010>>6)<<6=0b10000000 → ffs=7 → 选 rank 7
+            //   上次 rank=7 → offset=0, hi_mask=0b10110010 → ffs=1 → 回绕到 rank 1
+            //   上次 rank=4, wip_mask=0b00010010 → offset=5, hi_mask=0 → ffs(0b00010010)=1 → 高位没工作, 回绕到 rank 1
+            //
+            // 📌 第一次进入循环时:
+            //   recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks (不同 channel 从不同 rank 开始, 分散负载)
+            //   wip_mask 低 kNumScaleoutRanks 位全为 1 (因为 stored_finish_flag 初始化为 0, 即"还没结束")
+            //   所以 offset = (channel_idx%kNumScaleoutRanks + 1), 不会从同一起点开始
+            //   例: channel_idx=0, kNumScaleoutRanks=8
+            //    recv_scaleout_rank_idx = 0 % 8 = 0
+            //    wip_mask = 0b11111111  (所有 rank 都"还没结束")
+            //    offset = (0+1) % 8 = 1
+            //    hi_mask = (0b11111111 >> 1) << 1 = 0b11111110  ← 跳过 rank 0
+            //    ffs(0b11111110) = 1 → 第一次选 rank 1
+            //   如果是 channel_idx=3：
+            //    recv_scaleout_rank_idx = 3
+            //    offset = 4
+            //    hi_mask = (0b11111111 >> 4) << 4 = 0b11110000
+            //    ffs(0b11110000) = 4 → 第一次选 rank 4
             const auto offset = (recv_scaleout_rank_idx + 1) % kNumScaleoutRanks;
-            const auto hi_mask = (wip_mask >> offset) << offset;
+            const auto hi_mask = (wip_mask >> offset) << offset; //把offset个低位抹为零
             recv_scaleout_rank_idx = hi_mask ? ptx::ffs(hi_mask) : ptx::ffs(wip_mask);
 
-            // ---------- 等待选中 rank 的数据就绪 ----------
+
+            // ----------  ⚠️ 等待选中 rank 的数据就绪, 看scaleout_channel_signaled_tail有没有通知消费 ----------
+            // ⚠️ 虽然只是等待recv_scaleout_rank_idx一个，但是每次都会获取所有scaleout rank的tail进度
             // 检查: stored_scaleout_tail_idx > stored_scaleout_old_tail_idx (有新数据)
             //        stored_finish_flag > 0 (已结束, 无需再等)
             // exchange(arrived_or_finished, recv_scaleout_rank_idx):
@@ -926,6 +972,8 @@ hybrid_dispatch_impl(
             comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                 const uint32_t arrived_or_finished =
                     stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag > 0;
+                // ⚠️ 从lane[recv_scaleout_rank_idx]获取，其实就是单纯看recv_scaleout_rank_idx这个scaleout rank的数据是否能消费了
+                // ⚠️ 等待recv_scaleout_rank_idx这个scaleout rank的数据是否能消费了
                 if (ptx::exchange(arrived_or_finished, recv_scaleout_rank_idx))
                     return true;
 
@@ -941,32 +989,39 @@ hybrid_dispatch_impl(
                     return false;
                 }
 
-                // 重新读取 signaled_tail (scaleout warp 定期更新)
+                // ⚠️ 重新读取 signaled_tail (scaleout warp 定期更新)
                 //   ld_acquire_sys: 跨节点可见的 load (acquire 语义, 保证看到 scaleout warp 的写入)
                 //   unpack2: 解码 pack2(finish_flag, tail_count)
                 //   每个 lane 只读自己对应的 scaleout rank 的 tail
                 if (lane_idx < kNumScaleoutRanks) {
                     const auto signaled_tail = ptx::ld_acquire_sys<int64_t>(
                         workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx));
+                    //⚠️ 虽然只是等待recv_scaleout_rank_idx一个，但是每次都会获取所有scaleout rank的tail进度
+                    //⚠️ 对应 scaleout warp 写入时的 pack2(finish_flag, tail_count)，forward warp 读出来拆开，分别得到"是否发完"和"当前 tail 位置"。
                     math::unpack2<int, int64_t>(signaled_tail, stored_finish_flag, stored_scaleout_tail_idx);
                 }
                 __syncwarp();
                 return false;
             });
 
-            // ---------- 处理一个 chunk (最多 kNumSlotsPerForwardChunk 个 slot) ----------
+
+            // ---------- ⚠️ 一次性处理一个 chunk (最多 kNumSlotsPerForwardChunk 个 slot) ----------
             // 从 start_slot_idx 到 end_slot_idx, 每次 TMA load + NVLink 转发
             // exchange: 把本 lane 的 old_tail/tail 广播给所有 lane, 让每个 lane 都知道当前 rank 的起止位置
+            // ⚠️ 整个warp一起处理，所以要广播该scaleout rank的消费区域 start
             const auto start_slot_idx = ptx::exchange(stored_scaleout_old_tail_idx, recv_scaleout_rank_idx);
+            // ⚠️ 整个warp一起处理，所以要广播该scaleout rank的消费区域 end
             const auto end_slot_idx = std::min(
                 ptx::exchange(stored_scaleout_tail_idx, recv_scaleout_rank_idx),
                 start_slot_idx + kNumSlotsPerForwardChunk  // 限制 chunk 大小, 避免一次处理太多
             );
-            // 更新 old_tail: 本 lane 对应的 rank 已处理到 end_slot_idx
+            // ⚠️ 更新 old_tail: 本 lane 对应的 rank 已处理到 end_slot_idx
             if (lane_idx == recv_scaleout_rank_idx)
                 stored_scaleout_old_tail_idx = end_slot_idx;
 
-            // 遍历本 chunk 的每个 slot
+
+            // ⚠️ 遍历本 chunk 的每个 slot
+            // ⚠️ 前面 recv_buffer 选定了channel id, 现在 选定recv_scaleout_rank_idx
             const auto recv_buffer = scaleout_recv_buffer.get_rank_buffer(recv_scaleout_rank_idx);
             for (int slot_idx = start_slot_idx; slot_idx < end_slot_idx; ++ slot_idx) {
                 const auto token_buffer = recv_buffer.get_token_buffer(slot_idx);
@@ -975,7 +1030,7 @@ hybrid_dispatch_impl(
                 ptx::tma_store_wait();
                 __syncwarp();
 
-                // ---------- TMA load: recv_buffer → smem tma_buffer ----------
+                // ---------- 1️⃣ TMA load: recv_buffer → smem tma_buffer ----------
                 // elect_one: 只有一个 lane 发起 TMA load (整个 warp 共享 smem)
                 // get_num_bytes<false>: 只加载数据部分, 不含 mbarrier (这是 TMA load, 不是 store)
                 if (ptx::elect_one_sync()) {
@@ -986,7 +1041,7 @@ hybrid_dispatch_impl(
                 }
                 __syncwarp();
 
-                // ---------- 读取 top-k 索引, 计算目标 scaleup rank ----------
+                // ---------- 2️⃣ 读取 top-k 索引, 计算目标 scaleup rank ----------
                 // 注意: token 的 top-k expert 已经是全局编号, 需要减去本节点的 expert 偏移
                 //   dst_expert_idx -= scaleout_rank_idx * kNumExpertsPerScaleout
                 //   然后除以 kNumExpertsPerRank 得到目标 scaleup rank
@@ -998,10 +1053,10 @@ hybrid_dispatch_impl(
                 int stored_dst_scaleup_rank_idx = -1;
                 auto dst_expert_idx = lane_idx < kNumTopk ? tma_buffer.get_topk_idx_ptr()[lane_idx] : -1;
                 dst_expert_idx -= scaleout_rank_idx * kNumExpertsPerScaleout;
-                stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
-                    dst_expert_idx / kNumExpertsPerRank : -1;
+                stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ? dst_expert_idx / kNumExpertsPerRank : -1;
 
-                // ---------- 构建 Channel Linked List ----------
+                
+                // ---------- 3️⃣ 目标 scaleup rank 已经发送的计数 ----------
                 // linked_list_idx: 本 lane 的 top-k 选择在 linked list 中的位置
                 //   = 之前已发给同一 scaleup rank 的 token 数 (即 stored_scaleup_send_counters)
                 //   即: 本 token 是该 scaleup rank 收到的第 linked_list_idx 个 token
@@ -1014,22 +1069,38 @@ hybrid_dispatch_impl(
                 int linked_list_idx = -1;
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                    // ⚠️ ScaleupRanks分批 [0~31],[32~63],...，
+                    // ⚠️ 32个lane，每个lane所持有的信息不同，lane0持有[0,32,..],lane1持有[1,33,..]
+                    // ⚠️ 此刻，32个lane负责发送到多个expert，每个lane的stored_dst_scaleup_rank_idx可能相同可能不同
+                    // ⚠️ 找到stored_dst_scaleup_rank_idx的信息存在于哪个lane内
+                    // ⚠️ src_lane_idx就等于stored_dst_scaleup_rank_idx在其批次的相对索引，也就是lane的索引
                     const auto src_lane_idx = stored_dst_scaleup_rank_idx - j * 32;
                     const bool valid = 0 <= src_lane_idx and src_lane_idx < 32;
-                    const auto exchanged = ptx::exchange(
-                        stored_scaleup_send_counters[j], valid ? src_lane_idx : 0);
+                    // ⚠️ 拿到stored_scaleup_send_counters[j]的信息 =>  见stored_scaleup_send_counters[kNumScaleupRanksPerLane]上面注释
+                    // 💗 最终结果来看，就是拿到发送给 stored_dst_scaleup_rank_idx 的计数
+                    //    别看循环，以为拿到kNumScaleupRanksPerLane个计数，实际只拿到一次，因为valid=True只有一次！
+                    const auto exchanged = ptx::exchange(stored_scaleup_send_counters[j], valid ? src_lane_idx : 0);
+
+                    // 💗 valid=True只有一次，所以拿到的就是 发送给 stored_dst_scaleup_rank_idx 的计数
                     linked_list_idx = valid ? exchanged : linked_list_idx;
                 }
+
+
+                // ---------- 4️⃣ 构建 Channel Linked List ----------
                 // 将 linked list 位置写入 tma_buffer 的 metadata 区域 (与 TMA 数据一起转发)
                 //   transform_linked_list_idx: 逻辑索引 → 全局物理索引
                 //   kReuseSlotIndices 模式跳过 (slot 已知, 不需要 linked list)
                 if (not kReuseSlotIndices and lane_idx < kNumTopk) {
+                    // ⚠️ transform_linked_list_idx(linked_list_idx) ==> 得到索引 (channel_idx, linked_list_idx, scaleup_rank_idx)
+                    // ⚠️ 每个 token 在 scaleup_buffer 的 metadata 中存了自己的 linked_list_idx（transform 后的全局索引）
+                    // ⚠️ combine 阶段可以从 tail 位置反向遍历，找到该 scaleup rank 收到的所有 token 的原始索引。
+                    // ⚠️ 逻辑上串起了发给同一 scaleup rank 的所有 token，只是不用指针而是用递增序列号 + tail 指针实现的——从 tail 回退到 0 就是完整的链。
                     tma_buffer.get_linked_list_idx_ptr()[lane_idx] = transform_linked_list_idx(linked_list_idx);
                     ptx::tma_store_fence();
                 }
                 __syncwarp();
 
-                // ---------- Slot 分配 (去重) ----------
+                // ---------- 5️⃣ Slot 分配 (去重) ----------
                 // deduplicate: 同一 token 的多个 top-k 可能指向同一 scaleup rank
                 //   只有 master lane (最高位) 获得有效 slot 编号
                 //   atomicAdd: 从全局计数器中分配一个新 slot (保证不同 channel 的 token 不冲突)
@@ -1037,19 +1108,21 @@ hybrid_dispatch_impl(
                 // kReuseSlotIndices 模式: 直接从 dst_buffer_slot_idx 读取之前分配的 slot
                 //   (低延迟模式下, slot 编号在 dispatch 和 combine 之间保持不变)
                 int stored_dst_slot_idx = -1;
-                const auto dst_slot_idx_ptr = dst_buffer_slot_idx +
-                    recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
+                // dst_buffer_slot_idx[num_channels][num_scaleout_ranks][num_max_token_per_channel][topks]
+                const auto dst_slot_idx_ptr = dst_buffer_slot_idx +recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
+                // ⚠️ 可选：复用slot indices
                 if constexpr (kReuseSlotIndices) {
                     if (lane_idx < kNumTopk)
                         stored_dst_slot_idx = __ldg(dst_slot_idx_ptr + lane_idx);
                 } else {
-                    // 去重 + atomicAdd 分配 slot
+                    // ⚠️ 否则 去重 + atomicAdd 分配 slot
                     if (ptx::deduplicate(stored_dst_scaleup_rank_idx, lane_idx) and stored_dst_scaleup_rank_idx >= 0)
                         stored_dst_slot_idx = atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + stored_dst_scaleup_rank_idx, 1);
                 }
                 __syncwarp();
 
-                // ---------- TMA store: smem → scaleup_buffer[NVLink 对端 rank] ----------
+
+                // ---------- 6️⃣ TMA store: smem → scaleup_buffer[NVLink 对端 rank] ----------
                 // get_sym_ptr: 获取对端 rank 的 gmem 地址 (NVLink 可访问的对称地址)
                 //   stored_dst_scaleup_rank_idx: 目标 scaleup rank 编号
                 //   TMA store 1D: 整个 token (hidden + sf + metadata) 一次性写入
@@ -1063,21 +1136,37 @@ hybrid_dispatch_impl(
                 }
                 __syncwarp();
 
-                // ---------- 更新 per-scaleup 发送计数 ----------
+
+                // ---------- 7️⃣ 更新 per-scaleup 发送计数 ----------
                 // scaleup_send_mask: bitmap, 哪些 scaleup rank 收到了本 token 的某个 top-k
                 //   reduce_or: warp 级 OR, 汇总所有 lane 的目标 rank
                 // stored_scaleup_send_counters[j] += bit: 如果本 lane 负责的 scaleup rank 有新 token, 计数+1
                 //   这就是 linked list 的构建过程: 每发一个 token, 计数递增, 下一个 token 的 linked_list_idx 就更大
+                //
+                // 📌 举例: kNumScaleupRanks=8, kNumTopk=4
+                //   Step1 各 lane 构造 bitmap:
+                //     lane0 dst=rank2 → 0b00000100, lane1 dst=rank5 → 0b00100000
+                //     lane2 dst=rank2 → 0b00000100 (跟 lane0 相同!), lane3 dst=rank7 → 0b10000000
+                //   Step2 reduce_or 汇总: 0b00000100|0b00100000|0b00000100|0b10000000 = 0b10100100
+                //     scaleup_send_mask = 0b10100100 → rank 2,5,7 收到了 token
+                //   Step3 各 lane 从 mask 提取自己负责的 bit:
+                //     lane2: (0b10100100>>2)&1 = 1 → rank2 的 counter += 1 ✓
+                //     lane5: (0b10100100>>5)&1 = 1 → rank5 的 counter += 1 ✓
+                //     lane7: (0b10100100>>7)&1 = 1 → rank7 的 counter += 1 ✓
+                //     其余 lane: bit=0 → counter 不变
                 EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Invalid number of scale-up peers");
                 using mask_t = std::conditional_t<kNumScaleupRanks <= 32, unsigned, unsigned long long>;
                 const auto scaleup_send_mask = ptx::reduce_or(
                     stored_dst_scaleup_rank_idx >= 0 ?
                     (mask_t(1) << stored_dst_scaleup_rank_idx) : mask_t(0));
+                // ⚠️⚠️⚠️从这里可以看出【 计数≠slot indices 】，计算的话是真实按照多少个 token来计算，slot indices是会减少通信，相同nvl rank只发送一份
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
+                    // 每个lane只提取第j批的第lane个bit
                     stored_scaleup_send_counters[j] += (scaleup_send_mask >> (j * 32 + lane_idx)) & 1;
 
-                // ---------- 记录 metadata ----------
+
+                // ---------- 8️⃣ 记录 metadata ----------
                 // 写入 token_metadata_at_forward, 供 combine 反向路径使用
                 //   kReuseSlotIndices 模式跳过 (metadata 不变)
                 if constexpr (not kReuseSlotIndices) {
@@ -1098,13 +1187,16 @@ hybrid_dispatch_impl(
                     if (lane_idx < kNumTopk) {
                         metadata_ptr[2 + lane_idx] = stored_dst_scaleup_rank_idx;
                         metadata_ptr[2 + kNumTopk + lane_idx] = stored_dst_slot_idx;
+                        // ⚠️ 写入dst_buffer_slot_idx
                         dst_slot_idx_ptr[lane_idx] = stored_dst_slot_idx;
                     }
                 }
+                // ⚠️ 更新 num_tokens_processed
                 num_tokens_processed += 1;
                 __syncwarp();
             }
         }
+
 
         // ---------- 写入 metadata 结束标记 ----------
         // 在 metadata 数组末尾写入 -1, 表示 token 序列结束
@@ -1113,7 +1205,8 @@ hybrid_dispatch_impl(
             token_metadata_at_forward[num_tokens_processed * kNumForwardMetadataDims] = -1;
         __syncwarp();
 
-        // ---------- 更新 linked list 的 tail 指针 ----------
+
+        // ---------- ⚠️ 更新 linked list 的 tail 指针，scaleup tail的通知 ----------
         // stored_scaleup_send_counters[i]: 本 lane 向第 (i*32+lane_idx) 个 scaleup rank 发送的 token 总数
         //   这个值就是该 scaleup rank 在本 channel 的 linked list 的尾部位置
         //   transform_linked_list_idx: 逻辑位置 → 全局物理索引
@@ -1123,12 +1216,16 @@ hybrid_dispatch_impl(
         //   st_relaxed_sys: 写入对端 rank 的 gmem (NVLink 可见, release 语义)
         //   get_sym_ptr<ncclTeamTagLsa>: 获取对端 rank 的对称地址
         if constexpr (not kReuseSlotIndices) {
+            // ⚠️scaleup tail的记录的是 (channel_idx, stored_scaleup_send_counters[i], scaleup_rank_idx)的全局索引
             const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
+            // ⚠️ 写满 kNumScaleupRanks 个 rank
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
+                // ⚠️ j表示 scaleup_rank_idx j
                 if (const auto j = i * 32 + lane_idx; i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks) {
                     ptx::st_relaxed_sys(
                         gin.get_sym_ptr<ncclTeamTagLsa>(tail_ptr, j),
+                        // ⚠️ (channel_idx, stored_scaleup_send_counters[i], scaleup_rank_idx)
                         transform_linked_list_idx(stored_scaleup_send_counters[i]));
                 }
             }
