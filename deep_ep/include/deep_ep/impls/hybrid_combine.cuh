@@ -327,9 +327,11 @@ hybrid_combine_impl(
         //  └───────────────────────────────────────────────┘
         int dst_scaleup_rank_idx = channel_idx;
         int stored_ll_idx[kNumScaleupRanksPerLane] = {}, stored_token_idx[kNumScaleupRanksPerLane] = {};
+        // stored_ll_idx[..] = 0, stored_token_idx[..] = -1
         #pragma unroll
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
             stored_token_idx[i] = -1;
+
         while (true) {
             // ── Step 1: 从链表加载 token_idx ──
             //   每个 lane 负责读取自己对应的 scaleup rank 的链表当前节点
@@ -338,8 +340,12 @@ hybrid_combine_impl(
                 const auto j = i * 32 + lane_idx;
                 stored_token_idx[i] = i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks ?
                     __ldg(channel_linked_list +
+                          // channel_idx
                           channel_idx * (kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumScaleupRanks +
-                          stored_ll_idx[i] * kNumScaleupRanks + j) : -1;
+                          // stored_ll_idx[i]
+                          stored_ll_idx[i] * kNumScaleupRanks 
+                          // j
+                          + j) : -1;
             }
             __syncwarp();
 
