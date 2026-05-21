@@ -295,6 +295,9 @@ hybrid_dispatch_impl(
 
             // rank_count: 需要去重! 同一 token 的多个 top-k 可能指向同一 rank
             //   deduplicate: 只让最高位 lane 执行 atomicAdd, 避免重复计数
+            // ⚠️ 这里很关键了，去重了，意味着就算一个token需要发给rank0的多个expert，也只发送一次
+            // ⚠️ 而且记录下来的话，也只记录一次
+            // ⚠️ 所以记录的是真正的发送的token数！！！在epilogue算子里是会被使用的！！！！
             const auto dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
             if (ptx::deduplicate(dst_rank_idx, lane_idx) and dst_rank_idx >= 0)
                 atomicAdd_block(rank_count + dst_rank_idx, 1);
@@ -320,9 +323,15 @@ hybrid_dispatch_impl(
                 comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                     const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_notify_reduction_workspace_ptr() + i);
                     if ((status >> 32) == kNumSMs) {
-                        // encode_decode_positive: 编码为特殊格式 (0→无效, 正数→2*val+1)
-                        //   避免 RDMA 写的 "0 值" 与 "未写入" 混淆
-                        // ⚠️ 这里写入scaleout的send buffer
+                        // ⚠️ encode_decode_positive: 编码为特殊格式
+                        //   公式: encode(n) = -n - 1  (正数→负数, 0→-1)
+                        //   双重编码 = 解码: encode(encode(n)) = -(-n-1)-1 = n
+                        //   目的: 区分 "recv buffer 初始值 0 (未写入)" 和 "peer 写入 0 个 token"
+                        //     初始值 0 → encode(0)=-1, is_decoded_positive_ready(-1)=false → 未就绪 ✓
+                        //     peer 写 0 → 发送 encode(0)=-1 → 接收端 decode 得 0 → ready ✓
+                        //     peer 写 3 → 发送 encode(3)=-4 → 接收端 decode 得 3 → ready ✓
+                        // ⚠️ 这里是【编码】(发送端): 原始 count → 编码值, 写入 scaleout send buffer
+                        // ⚠️ 接收端再调用 encode_decode_positive 解码 (双重编码=解码)
                         workspace_layout.get_scaleout_rank_expert_count_ptr<true>()[i] =
                             math::encode_decode_positive<int>(status & 0xffffffffll);
 
@@ -357,17 +366,22 @@ hybrid_dispatch_impl(
             if (thread_idx < kNumScaleoutRanks) {
                 // 一个thread 负责发送给一个 scaleout rank
                 const auto dst_scaleout_rank_idx = thread_idx;
+                // ⚠️ ncclGinOptFlagsAggregateRequests: RDMA 请求聚合优化标志
+                //   告诉 NIC "这个请求先攒着, 不要立刻发, 等后续请求一起打包成一个 RDMA 操作"
+                //   用法: 除了最后一个请求, 都加此 flag → 多个小请求合并为一次 RDMA 写, 减少跨节点通信开销
+                //   下面第1个 put(rank_count) 带 AggregateRequests="先不发, 攒着"
+                //         第2个 put(expert_count) 无 flag="这是最后一个, flush 出去"
                 gin.put<ncclTeamTagRail>(
                     workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),  //recv_sym_ptr：远端接收区地址 → dst
                     workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),//send_sym_ptr：本地发送区地址 → src
                     // 发送 kNumScaleupRanks 个数据
                     kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx,
-                    ncclGinOptFlagsAggregateRequests);
+                    ncclGinOptFlagsAggregateRequests);  // ← "先攒着, 后面还有"
                 gin.put<ncclTeamTagRail>(
                     workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
                     workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
                     // 发送 kNumExpertsPerScaleout 个数据
-                    kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx);
+                    kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx);  // ← 无 flag, 触发 flush
             }
             __syncwarp();
 
@@ -385,6 +399,7 @@ hybrid_dispatch_impl(
                     int decoded;
                     comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check){
                         // -n-1, -(n-1)-1 = -n+1-1 = n
+                        // ⚠️ 解码
                         decoded = math::encode_decode_positive(ptx::ld_acquire_sys<int>(ptr));
                         if (math::is_decoded_positive_ready(decoded))
                             return true;
@@ -413,7 +428,7 @@ hybrid_dispatch_impl(
             //   高 32 位 = 到达的 scaleup rank 数 (用于对端判断是否所有 scaleup rank 都写了)
             #pragma unroll
             for (int i = thread_idx; i < kNumScaleupRanks; i += kNumNotifyThreads) {
-                // ⚠️ All to All 之后求和，等价于 Reduce-Scatter
+                // ⚠️ All to All 之后求和SUM，等价于 Reduce-Scatter
                 // 每一个thread，各自等待所有scaleout rank的rank_count[i]到达，然后求和
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
                     return workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_peer_idx, i);
@@ -445,7 +460,7 @@ hybrid_dispatch_impl(
             //     注意: expert 是按 rank 分配的, i/kNumExpertsPerRank = 目标 scaleup rank
             #pragma unroll
             for (int i = thread_idx; i < kNumExpertsPerScaleout; i += kNumNotifyThreads) {
-                // ⚠️ All to All 之后求和，等价于 Reduce-Scatter
+                // 求和
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
                     return workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_peer_idx, i);
                 }, true);
@@ -499,7 +514,7 @@ hybrid_dispatch_impl(
                             math::encode_decode_positive(aligned_count);
                     }
 
-                    // 只累计统计各个expert的token数 (供外部监控)
+                    // ⚠️ 只累计统计各个expert的token数 (供外部监控)
                     if (cumulative_local_expert_recv_stats != nullptr and thread_idx >= kNumScaleupRanks)
                         atomicAdd(cumulative_local_expert_recv_stats + (thread_idx - kNumScaleupRanks), count);
 
@@ -686,7 +701,7 @@ hybrid_dispatch_impl(
         };
 
         // ---------- 主循环: 遍历本 channel 的所有 token ----------
-        // 1️⃣ tma load第一个token到smem tma_buffer
+        // 1️⃣ tma load第一个token的hidden和scale factor到smem tma_buffer
         preload_next_token(channel_idx);
 
         // ⚠️ 同一个warp处理一个channel，但是同个channel内的token不是顺序划分的
@@ -695,6 +710,8 @@ hybrid_dispatch_impl(
             //   stored_dst_scaleout_rank_idx: 本 lane 的 top-k 选择发给哪个 scaleout rank
             //   expert_idx / kNumExpertsPerScaleout = scaleout rank (expert 按 scaleout rank 分段)
             EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes for loading top-k indices");
+
+            // 2️⃣ load top-k 索引 + 权重到smem tma_buffer，
             // ⚠️ 一个token，每个lane负责发送一个scaleout rank
             // ⚠️ 每个lane的 dst_expert_idx是不同的，但是stored_dst_scaleout_rank_idx可能是相同的，发送的不同的expert可能在同一个scaleout rank
             int stored_dst_scaleout_rank_idx = -1;
@@ -722,7 +739,7 @@ hybrid_dispatch_impl(
             ptx::tma_store_fence();
             __syncwarp();
 
-            // ---------- Slot 分配 + Scaleout tail 更新 ----------
+            // 3️⃣ 分配slot 且 去重，如果lane负责发送同一个rank，则去重，只让master lane发送该token
             // deduplicate: 同一 token 的多个 top-k 可能指向同一 scaleout rank
             //   只有 master lane 获得有效 slot 编号
             //   slot 编号 = 该 rank 在本 channel 的当前 tail (exchange 先读后加)
@@ -739,7 +756,8 @@ hybrid_dispatch_impl(
                 // ⚠️其余：返回false，值为初始值-1，后续判断>=0，只让master_lane发送token
                 stored_dst_slot_idx = stored_old_slot_idx;
 
-            // ⚠️ 更新 scaleout tail: 每新增一个 scaleout rank 的 token, tail+1
+
+            // 4️⃣ 更新 scaleout tail: 每新增一个 scaleout rank 的 token, tail+1
             //   scaleout_rank_mask: bitmap, 哪些 scaleout rank 有新 token
             //   (mask >> lane_idx) & 1: 本 lane 对应的 rank 是否有新 token
             const auto scaleout_rank_mask = ptx::reduce_or(stored_dst_scaleout_rank_idx >= 0 ? (1u << stored_dst_scaleout_rank_idx) : 0u);
@@ -747,7 +765,9 @@ hybrid_dispatch_impl(
             stored_scaleout_tail += (scaleout_rank_mask >> lane_idx) & 1;
 
 
-            // ⚠️ 等到x gmem ---tma load--> tma_buffer完成，然后执行 tma_buffer ---tma store--> send_buffer
+            // 5️⃣ 如果需要跨节点，发送时才 TMA store 到 send_buffer，而且只需要一份token
+            // 等待x gmem ---tma load--> tma_buffer完成，然后执行 tma_buffer ---tma store--> send_buffer
+            // tma_load需要分开load，tma_store就能全部store，是因为load的src是分开的不同变量，store是同一个变量且连续
             if (ptx::elect_one_sync()) {
                 // arrive_and_set_tx: 注册 TMA load 的预期字节数
                 ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
@@ -764,7 +784,7 @@ hybrid_dispatch_impl(
             __syncwarp();
 
 
-            // ⚠️本地直写: 如果 top-k 选择指向本节点, 直接 TMA store 到 recv_buffer
+            // 6️⃣本地直写: 如果 top-k 选择指向本节点, 直接 TMA store 到 recv_buffer
             //   不经过 send_buffer, 也不需要 RDMA
             //   stored_dst_scaleout_rank_idx == scaleout_rank_idx: 发给本节点
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx == scaleout_rank_idx) {
@@ -779,10 +799,10 @@ hybrid_dispatch_impl(
             __syncwarp();
 
 
-            // ⚠️ 预加载下一个 token (与 IBGDA RDMA 请求重叠, 隐藏延迟)
+            // 7️⃣ 预加载下一个 token (与 IBGDA RDMA 请求重叠, 隐藏延迟)
             preload_next_token(token_idx + kNumChannels);
 
-            // ⚠️ RDMA 发送: 如果 top-k 选择指向其他节点, 通过 gin.put 发送
+            // 8️⃣ RDMA 发送: 如果 top-k 选择指向其他节点, 通过 gin.put 发送
             //   src: send_buffer 中的数据 (刚才 TMA store 写入的)
             //   dst: 对端节点的 recv_buffer (直接写入对端 gmem)
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
@@ -798,11 +818,11 @@ hybrid_dispatch_impl(
             __syncwarp();
 
 
-            // ⚠️ 定期通知对端 forward warp: 本 channel 新增了多少 token
+            // 9️⃣ 定期通知对端 forward warp: 本 channel 新增了多少 token
             update_scaleout_tail();
         }
 
-        // ⚠️ 循环结束后, 刷新未发送的 tail (finish_flag=true 通知对端本 channel 已结束)
+        // 🔟 循环结束后, 刷新未发送的 tail (finish_flag=true 通知对端本 channel 已结束)
         update_scaleout_tail(true);
 
 
@@ -833,6 +853,12 @@ hybrid_dispatch_impl(
         //
         // 每个 forward warp = 一个 channel (与 scaleout warp 一一对应)
         //   对端 scaleout warp 写入 recv_buffer → 本 forward warp 读出并转发
+        // ⚠️ 不同 forward warp 不会消费同一个 scaleout rank 的同一数据:
+        //   - kNumScaleoutWarps == kNumForwardWarps, kNumChannelsPerSM = kNumScaleoutWarps
+        //   - scaleout/forward warp 的 channel_idx 计算方式相同, 保证一一对应
+        //   - recv_buffer 按 channel 物理分区: [channel][scaleout_rank][slot], 不同 channel 互不重叠
+        //   - signaled_tail 也是 per-channel: signaled_tail[channel_idx][scaleout_rank]
+        //   所以虽然不同 forward warp 可能轮询同一 scaleout rank, 但读的是该 rank 在不同 channel 上的数据分区
 
         // Channel 映射: 与 scaleout warp 的 channel_idx 计算方式相同, 保证一一对应
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
@@ -910,7 +936,7 @@ hybrid_dispatch_impl(
         int stored_scaleup_send_counters[kNumScaleupRanksPerLane] = {};  
 
 
-         // ⚠️ 当前轮询的 scaleout rank，每个warp都轮序所有scaleout rank，只不过轮序的begin不一样
+         // 📌📌📌📌 当前轮询的 scaleout rank，每个warp都轮序所有scaleout rank，只不过轮序的begin不一样
         int recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks; 
 
         // ⚠️wip_mask: "work in progress" 位掩码

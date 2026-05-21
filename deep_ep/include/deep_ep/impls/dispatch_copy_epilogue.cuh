@@ -89,10 +89,10 @@ dispatch_copy_epilogue_impl(
     int*         recv_src_metadata,                 // 【输出】[num_recv, 2+topk], 供 combine 反向路由
     int*         channel_linked_list,               // 【输出】hybrid 非 cached: per-channel 链表体
     int          num_recv_tokens,                   // 【输入】CPU-sync 下是精确值；否则为 worst-case 哨兵
-    constint    recv_sf_token_stride,              // 【输入】recv_sf 在 token 维的 stride(packs 数)
-    constint    recv_sf_hidden_stride,             // 【输入】recv_sf 在 hidden 维的 stride
-    constint    scaleout_rank_idx,                 // 【输入】本 rank 的 scaleout 编号
-    constint    scaleup_rank_idx) {                // 【输入】本 rank 的 scaleup 编号
+    constint    recv_sf_token_stride,               // 【输入】recv_sf 在 token 维的 stride(packs 数)
+    constint    recv_sf_hidden_stride,              // 【输入】recv_sf 在 hidden 维的 stride
+    constint    scaleout_rank_idx,                  // 【输入】本 rank 的 scaleout 编号
+    constint    scaleup_rank_idx) {                 // 【输入】本 rank 的 scaleup 编号
 
     // ==================== 基础索引 ====================
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
@@ -237,10 +237,12 @@ dispatch_copy_epilogue_impl(
         //   例: token T 的 top-k: lane0→expert3(rank0), lane1→expert7(rank1), lane2→expert9(rank1)
         //       本 rank=rank1: gather(in_range)=0b110, master=2 (最高位)
         const auto in_range = expert_start_idx <= dst_expert_idx and dst_expert_idx < expert_end_idx;
+        // 这些lane拿到的dst_expert_idx不可能是有重复的，除了-1，master_lane是抽出一个代表
         const auto master_src_topk_idx = ptx::get_master_lane_idx(ptx::gather(in_range));
         // 转换为本地 expert 索引 (减去 rank 起始偏移)， 不在范围的设为 -1
         dst_expert_idx = in_range ? dst_expert_idx - expert_start_idx : -1;
-        // 去重验证: 同一个 token 的多个 top-k 选择如果指向同一 expert, 只应有一个 lane 是 master
+        // 不变量验证: top-k 选出的 expert 互不相同, 转换为本地索引后也应唯一 (除 -1 外)
+        // 这些lane拿到的dst_expert_idx不可能是有重复的，除了-1
         EP_DEVICE_ASSERT(ptx::deduplicate(dst_expert_idx, lane_idx) or dst_expert_idx == -1);
         // 非展开模式: 直接写入 recv_topk_idx (本地 expert 索引)
         // 展开模式：不用到 recv_topk_idx
@@ -259,6 +261,8 @@ dispatch_copy_epilogue_impl(
         if (not kDoExpand and ptx::elect_one_sync()) {
             dst_tensor_idx = i;
         } else if (kDoExpand and dst_expert_idx >= 0) {
+            // ⚠️ align后的真实前缀和，直接在这里加1，那改完就不是前缀和了。
+            // ⚠️ expert prefix sum[dst_expert_idx]顺序累加上去没问题，应该算是复用psum_num_recv_tokens_per_expert，后面应该用不到这个了
             dst_tensor_idx = atomicAdd(psum_num_recv_tokens_per_expert + dst_expert_idx, 1);
         }
         __syncwarp();
@@ -270,6 +274,7 @@ dispatch_copy_epilogue_impl(
         __syncwarp();
 
         
+        
         // ────────────── Step 7: 维护 channel 链表 (仅跨节点+非缓存模式) ──────────────
         // 背景: 跨节点 RDMA 场景下, token 按 channel 传输但到达顺序是乱序的
         //   后续需要按逻辑顺序清理 channel, 因此用单向链表把同一 channel 上的 token 串起来
@@ -277,11 +282,12 @@ dispatch_copy_epilogue_impl(
         // channel_linked_list: 全局 gmem 数组, 每个 (channel, scaleup_rank) 对应一条链表
         //   链表节点值 = token 全局序号, 终止符 = -1
         //
-        // tma_buffer metadata 布局 (详见 layout.cuh):
-        //   [0..num_topk-1]          : topk_idx (expert 索引)
-        //   [num_topk..2*num_topk-1] : topk_weights
-        //   [2*num_topk]             : src_token_global_idx
-        //   [2*num_topk+1]           : linked_list_idx ← get_linked_list_idx_ptr() 指向这里
+        // tma_buffer hidden后 布局 (详见 layout.cuh):
+        //   [num_topk]          : topk_idx (expert 索引) 
+        //   [num_topk]          : topk_weights
+        //  tma_buffer metadata 布局（with_metadata 时的额外部分，共 1 + num_topk 个 int）：
+        //   [1]                  : src_token_global_idx
+        //   [num_topk]           : linked_list_idx ← get_linked_list_idx_ptr() 指向这里
         //
         //   主 dispatch kernel 在发送阶段已将 linked_list_idx 写入 smem,
         //   值为 "前驱 token 在 channel_linked_list 数组中的 slot 位置"
@@ -383,7 +389,6 @@ dispatch_copy_epilogue_impl(
             }
         }
 
-
         // ────────────── Step 10: Store top-k weights → recv_topk_weights ──────────────
         // 展开/不展开模式的区别:
         //   kDoExpand=true:  每个 token 按其 dst_tensor_idx 写一行 (权重与 token 一一对应)
@@ -396,6 +401,8 @@ dispatch_copy_epilogue_impl(
             recv_topk_weights[i * kNumTopk + lane_idx] = tma_buffer.get_topk_weights_ptr()[lane_idx];
         }
         __syncwarp();
+
+
 
         // ────────────── Step 11: Store source metadata → recv_src_metadata ──────────────
         // metadata 布局 (每 token 占 kMetadataStride=2+kNumTopk 个 int):
@@ -414,13 +421,14 @@ dispatch_copy_epilogue_impl(
             if constexpr (kNumScaleoutRanks == 1) {
                 recv_src_metadata[i * kMetadataStride + 1] = current_rank_idx * kNumTopk + master_src_topk_idx;
             } else {
+                // 混合模式: rank 内 slot 编号 × topk + 代表 lane 编号
                 recv_src_metadata[i * kMetadataStride + 1] = (i - current_rank_start) * kNumTopk + master_src_topk_idx;
             }
         }
         __syncwarp();
 
         // 展开/归约源索引: 每个 top-k 选择对应的输出行号
-        //   用于 combine 阶段的加权归约: 知道每个 expert 结果写回哪一行
+        // ⚠️ 用于 combine 阶段的加权归约: 知道每个 expert 结果写回哪一行
         if (kDoExpand and lane_idx < kNumTopk)
             recv_src_metadata[i * kMetadataStride + 2 + lane_idx] = dst_tensor_idx;
         __syncwarp();
