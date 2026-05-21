@@ -99,7 +99,10 @@ namespace deep_ep::elastic {
 //  kNumChannels          : 总 channel 数 = kNumChannelsPerSM * kNumSMs
 //  kNumMaxTokensPerChannel : 每 channel 最多 token 数 = ceil(kNumMaxTokensPerRank / kNumChannels)
 // ──────────────────────────────────────────────────────────────────────
-template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
+template <
+          // ⚠️ kUseExpandedLayout 默认为 True
+          bool kUseExpandedLayout, bool kAllowMultipleReduction,
+
           int kNumSMs,
           int kNumScaleupWarps, int kNumForwardWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -107,19 +110,33 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
           int kNumQPs, int64_t kNumTimeoutCycles,
+
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
+
+          // ⚠️ 通知间隔
           int kNumScaleupUpdateInterval = 3,
+
+          // ⚠️ 还是一个warp一个channel
           int kNumChannelsPerSM = kNumForwardWarps,
           int kNumChannels = kNumChannelsPerSM * kNumSMs,
+          // ⚠️ ceil_div(kNumMaxTokensPerRank, kNumChannels)
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
+
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumWarps = kNumScaleupWarps + kNumForwardWarps,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
+
+          // ⚠️ use_rank_layout: 决定用 "按rank" 还是 "按topk" 的布局
+          // not kAllowMultipleReduction → false：固定用 topk 布局
+          // kAllowMultipleReduction：rank 数 ≤ topk 数 → true用 rank 布局（更紧凑）
           bool kUseScaleoutRankLayout = use_rank_layout<kAllowMultipleReduction, kNumScaleoutRanks, kNumTopk>(),
           bool kUseScaleupRankLayout = use_rank_layout<kAllowMultipleReduction, kNumScaleupRanks, kNumTopk>(),
+          // ⚠️ 返回 use_rank_layout() ? kNumRanks : kNumTopk;
+          // get_num_tokens_in_layout: 布局中每组的 token 槽位数
           int kNumTokensInScaleoutLayout = get_num_tokens_in_layout<kAllowMultipleReduction, kNumScaleoutRanks, kNumTopk>(),
           int kNumTokensInScaleupLayout = get_num_tokens_in_layout<kAllowMultipleReduction, kNumScaleupRanks, kNumTopk>()>
+
 __global__ void __launch_bounds__(kNumThreads, 1)
 hybrid_combine_impl(
     // ── 输出/输入张量 ──
@@ -262,6 +279,7 @@ hybrid_combine_impl(
         // ⚠️ update_tails: 批量更新 scaleup tail
         //   当 finish=true 或计数器达到 kNumScaleupUpdateInterval 时触发
         //   使用 st_release_sys 写入对端 rank 的 tail 指针 (NVLink 可见, release 语义)
+        const auto update_tails = [&](const bool& finish = false) {
             ++ update_counter;
             if (finish or update_counter == kNumScaleupUpdateInterval) {
                 // Wait all TMA stores to finish
@@ -533,7 +551,16 @@ hybrid_combine_impl(
 
         // ⚠️ 链表遍历结束, 强制更新所有未发出的 tail (finish=true)
         update_tails(true);
+
+
+
+
     } else {
+
+
+
+
+
         // ═══════════════════════════════════════════════════════════════════
         //  Forward Warps: 重放 dispatch 元数据, 等待 scaleup 数据就绪,
         //                 从 scaleup_buffer 读取 → reduce → RDMA 转发到跨节点 rank
