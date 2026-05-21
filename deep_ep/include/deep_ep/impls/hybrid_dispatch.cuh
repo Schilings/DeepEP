@@ -87,6 +87,8 @@ namespace deep_ep::elastic {
 template <bool kDoCPUSync,
           bool kReuseSlotIndices,
           int kNumSMs,
+          // 是的，kNumScaleoutWarps == kNumForwardWarps，代码里有编译期强制保证
+          // 所以channel是一对一的warp，一个warp一个channel
           int kNumNotifyWarps, int kNumScaleoutWarps, int kNumForwardWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
           int kNumHiddenBytes, int kNumSFPacks,
@@ -1185,12 +1187,12 @@ hybrid_dispatch_impl(
                 const auto scaleup_send_mask = ptx::reduce_or(
                     stored_dst_scaleup_rank_idx >= 0 ?
                     (mask_t(1) << stored_dst_scaleup_rank_idx) : mask_t(0));
-                // ⚠️⚠️⚠️从这里可以看出【 计数≠slot indices 】，计算的话是真实按照多少个 token来计算，slot indices是会减少通信，相同nvl rank只发送一份
+                // ⚠️⚠️⚠️从这里可以看出【 计数==slot indices 】，都是去重后的。会减少通信，相同nvl rank只发送一份
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
                     // 每个lane只提取第j批的第lane个bit
                     stored_scaleup_send_counters[j] += (scaleup_send_mask >> (j * 32 + lane_idx)) & 1;
-
+ 
 
                 // ---------- 8️⃣ 记录 metadata ----------
                 // 写入 token_metadata_at_forward, 供 combine 反向路径使用
