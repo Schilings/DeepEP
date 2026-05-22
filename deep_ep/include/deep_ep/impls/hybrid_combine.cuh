@@ -265,17 +265,19 @@ hybrid_combine_impl(
             scaleup_buffer = scaleup_buffer.get_rank_buffer(scaleup_rank_idx);
 
         // 展开模式一定是前向 (无 topk_weights), 如果传了 topk_weights 说明调用错误
+        // ⚠️ 如果kUseExpandedLayout，那么top weights应该已经融合计算在里面了吧？
         if constexpr (kUseExpandedLayout)
             EP_DEVICE_ASSERT(topk_weights == nullptr);
 
         // ── Tail 更新器: 批量通知对端 rank "我发了多少 token" ──
         //   st.release.sys 较慢 (~100 cycle), 所以每 kNumScaleupUpdateInterval 个 token 才更新一次
-        //   stored_num_tokens_sent[i]: 本 lane 向第 (i*32+lane_idx) 个 scaleup rank 发送的 token 累计
-        //   stored_old_num_tokens_sent[i]: 上次通知时的值 (跳过无变化的更新, 节省带宽)
+        //   ⚠️ stored_num_tokens_sent[i]: 本 lane 向第 (i*32+lane_idx) 个 scaleup rank 发送的 token 累计
+        //   ⚠️ stored_old_num_tokens_sent[i]: 上次通知时的值 (跳过无变化的更新, 节省带宽)
         int update_counter = 0;
         int stored_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         int stored_old_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
+
         // ⚠️ update_tails: 批量更新 scaleup tail
         //   当 finish=true 或计数器达到 kNumScaleupUpdateInterval 时触发
         //   使用 st_release_sys 写入对端 rank 的 tail 指针 (NVLink 可见, release 语义)
@@ -335,6 +337,12 @@ hybrid_combine_impl(
         while (true) {
             // ── Step 1: 从链表加载 token_idx ──
             //   每个 lane 负责读取自己对应的 scaleup rank 的链表当前节点
+            // 1️⃣ 以warp的视角，分析一个token
+            //        1. 这个token属于 channel channel_idx,分channel存储，因此scaleup ranks间不会相互影响
+            //        2. 这个token是scaleup rank j 转发过来的
+            //        3. 这个token是scaleup rank j 发给我的第 stored_ll_idx[i] 个 token, 第一次遍历 stored_ll_idx[i] = 0，都是第0个token
+            //        4. 拿到的值：这个token在转发给我时在我的scaleup buffer中的顺序（不是位置，因为跳过空的slot，例如rank0有10个slot，只要3个有token）
+            //        4. 总结而言，就是获取每个scaleup rank j 发给我的 第 stored_ll_idx[i] 个 token 的 位置
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
                 const auto j = i * 32 + lane_idx;
@@ -342,7 +350,7 @@ hybrid_combine_impl(
                     __ldg(channel_linked_list +
                           // channel_idx
                           channel_idx * (kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumScaleupRanks +
-                          // stored_ll_idx[i]
+                          // stored_ll_idx[i] ⚠️ 一开始都是0
                           stored_ll_idx[i] * kNumScaleupRanks 
                           // j
                           + j) : -1;
@@ -351,6 +359,7 @@ hybrid_combine_impl(
 
             // ── Step 2: 检查所有 rank 是否都遍历完了 ──
             //   如果所有 lane 的 token_idx 都是负数, 说明链表全部结束
+            // 2️⃣ 拿到的值都是负数，说明是-1，链表的最后一个值token后面会跟placeholder一个-1用于标记结束
             bool exited = true;
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
@@ -361,23 +370,29 @@ hybrid_combine_impl(
             // ── Step 3: Round-robin 处理活跃 rank ──
             //   wip_mask: bitmap, bit=1 表示该 scaleup rank 还有 token 需要处理
             //   round-robin 选择下一个 dst_scaleup_rank_idx, 避免饥饿
+            // 3️⃣ 现在stored_token_idx 记录了每个scaleup rank 发给我的  各一个token 的 在我这的顺序
+            //     那么这个顺序就是唯一的，可以帮我定位到时哪些token,然后把token返还回去
+            //     ❶ 如果是no expand模式，那么直接通过顺序就能定位到哪个token
+            //     ❷ 如果是expand模式，那么需要recv_metadata来定位到哪个token，顺序--> recv_metadata --> expand后的recv_x
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up ranks for 64-bit mask");
             using mask_t = std::conditional_t<(kNumScaleupRanks <= 32), uint32_t, uint64_t>;
             mask_t wip_mask = 0;
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
                 wip_mask |= static_cast<mask_t>(ptx::gather(stored_token_idx[j] >= 0)) << (j * 32);
+
             while (wip_mask) {
-                // ── 3a: Round-robin 选择下一个活跃 rank ──
+                // ── 4️⃣: Round-robin scaleup_rank_idx 一个一个scaleup_rank来
+                //   不是逐token，是逐scaleup_rank，是因为上面就是按照 scaleup rank有没有发token来筛选出来的
+                //   而且expand模式多个token返还给同一个scaleup_rank
                 //   从 dst_scaleup_rank_idx+1 开始找, 找不到则从头找 (ffs = find first set)
                 const auto start = (dst_scaleup_rank_idx + 1) % kNumScaleupRanks;
                 const auto hi_mask = (wip_mask >> start) << start;
                 dst_scaleup_rank_idx = hi_mask ? ptx::ffs(hi_mask) : ptx::ffs(wip_mask);
                 wip_mask ^= static_cast<mask_t>(1) << dst_scaleup_rank_idx;
 
-                // ── 3b: 从持有 token_idx 的 lane 交换到所有 lane ──
-                //   token_idx 存在于 dst_scaleup_rank_idx 对应的 lane 上
-                //   使用 exchange (warp shuffle) 广播给该 rank 组内的所有 lane
+                // ── 5️⃣: 从持有 token_idx 的 lane 拿到token_idx值即这个token在我这的顺序，然后广播到所有 lane
+                //        这个顺序token_idx，也就是对recv_metadata的索引，也是no expand模式对recv_x的索引
                 int token_idx = -1;
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
@@ -386,14 +401,21 @@ hybrid_combine_impl(
                 }
                 token_idx = ptx::exchange(token_idx, dst_scaleup_rank_idx % 32);
 
-                // ── 3c: 读取源 metadata, 定位 token 在 scaleup_buffer 中的位置 ──
+
+                // ── 6️⃣: 读取源 metadata, 定位 token 在 scaleup_buffer 中的位置 ──
                 //   src_metadata 布局: [src_global_token_idx, slot_info, topk_0, topk_1, ...]
                 //   stride = 2 + kNumTopk
                 constexpr int kMetadataStride = 2 + kNumTopk;
+                // ⚠️src_global_token_idx = rank_idx * kNumMaxTokensPerRank + src_token_idx
+                // 可以提取到rank_idx：这个token来自于哪个rank_idx(虽然是dst_scaleup_rank_idx转发给我的)，但是不代表是他给我的
+                // 可以提取到src_token_idx： 这个token在src_rank_idx中的顺序 
+                // 可以提取到src_scaleout_rank_idx = rank_idx/kNumScaleupRanks
                 const auto src_global_token_idx = __ldg(src_metadata + token_idx * kMetadataStride + 0);
                 const auto src_token_idx = src_global_token_idx % kNumMaxTokensPerRank;
                 const auto src_scaleout_rank_idx = src_global_token_idx / (kNumMaxTokensPerRank * kNumScaleupRanks);
                 auto token_buffer = [&]() {
+                    // ⚠️ direct： src_metadata[token_idx][1] = current_rank_idx * kNumTopk + master_src_topk_idx
+                    // ⚠️ hybrid： src_metadata[token_idx][1] = (i-cur_rank_start)*kNumTopk + master_topk_idx
                     if constexpr (kUseScaleupRankLayout) {
                         const auto src_slot_idx = __ldg(src_metadata + token_idx * kMetadataStride + 1) / kNumTopk;
                         return scaleup_buffer.get_token_buffer(src_slot_idx);
@@ -407,6 +429,7 @@ hybrid_combine_impl(
                 token_buffer.set_base_ptr(gin.get_sym_ptr<ncclTeamTagLsa>(token_buffer.get_base_ptr(), dst_scaleup_rank_idx));
                 // ⚠️ 将 token_buffer 的基地址转换为对端 rank 的对称地址
                 //   TMA store 需要写到的目标是对端 rank 的 gmem, 使用 NVLink 对称地址
+
 
                 // ── 3d: 读取展开模式的 top-k slot 索引 ──
                 EP_STATIC_ASSERT(kHidden % (32 * sizeof(int4) / sizeof(nv_bfloat16)) == 0, "Invalid hidden");
