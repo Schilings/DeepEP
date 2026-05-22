@@ -402,7 +402,7 @@ hybrid_combine_impl(
                 token_idx = ptx::exchange(token_idx, dst_scaleup_rank_idx % 32);
 
 
-                // ── 6️⃣: 读取源 metadata, 定位 token 在 scaleup_buffer 中的位置 ──
+                // ── 6️⃣: 读取源 metadata, 定位 token 在 scaleup_buffer 中的位置 ──  
                 //   src_metadata 布局: [src_global_token_idx, slot_info, topk_0, topk_1, ...]
                 //   stride = 2 + kNumTopk
                 constexpr int kMetadataStride = 2 + kNumTopk;
@@ -415,11 +415,13 @@ hybrid_combine_impl(
                 const auto src_scaleout_rank_idx = src_global_token_idx / (kNumMaxTokensPerRank * kNumScaleupRanks);
                 auto token_buffer = [&]() {
                     // ⚠️ direct： src_metadata[token_idx][1] = current_rank_idx * kNumTopk + master_src_topk_idx
-                    // ⚠️ hybrid： src_metadata[token_idx][1] = (i-cur_rank_start)*kNumTopk + master_topk_idx
-                    if constexpr (kUseScaleupRankLayout) {
+                    // ⚠️ hybrid： src_metadata[token_idx][1] = (i-cur_rank_start)*kNumTopk + master_src_topk_idx
+                    if constexpr (kUseScaleupRankLayout) { 
+                        // ⚠️ 看 current_rank_idx 或者 (i-cur_rank_start)
                         const auto src_slot_idx = __ldg(src_metadata + token_idx * kMetadataStride + 1) / kNumTopk;
                         return scaleup_buffer.get_token_buffer(src_slot_idx);
-                    } else {
+                    } else { 
+                        // ⚠️ 看 master_src_topk_idx
                         const auto master_topk_idx = __ldg(src_metadata + token_idx * kMetadataStride + 1) % kNumTopk;
                         return scaleup_buffer
                             .get_rank_buffer(master_topk_idx)
@@ -431,12 +433,14 @@ hybrid_combine_impl(
                 //   TMA store 需要写到的目标是对端 rank 的 gmem, 使用 NVLink 对称地址
 
 
-                // ── 3d: 读取展开模式的 top-k slot 索引 ──
+                
                 EP_STATIC_ASSERT(kHidden % (32 * sizeof(int4) / sizeof(nv_bfloat16)) == 0, "Invalid hidden");
 
+                // ── 7️⃣: 读取展开模式的 top-k slot 索引 ，expand 模式才不为-1，
+                //         recv_metadata --> 多个stored_topk_slot_idx是这个token分开计算后的在recv_x的位置
                 // Read source indices for expand mode
                 int stored_topk_slot_idx = -1;
-                if constexpr (kUseExpandedLayout) {
+                if constexpr (kUseExpandedLayout) { 
                     if (lane_idx < kNumTopk)
                         stored_topk_slot_idx = __ldg(src_metadata + token_idx * kMetadataStride + (2 + lane_idx));
                     __syncwarp();
@@ -456,31 +460,49 @@ hybrid_combine_impl(
                 //  │   逐 top-k: TMA load x[slot_k] → smem → TMA store → rank_k    │
                 //  │   每个 top-k 分别写入不同 rank 的 buffer                        │
                 //  └──────────────────────────────────────────────────────────────────┘
+                // ⚠️ 
                 auto reduce_valid_mask = ptx::gather(stored_topk_slot_idx >= 0);
                 // ⚠️ no_local_reduce 判断:
                 //   不展开模式: 直接 no_local_reduce=true
                 //   展开模式: 仅当只有1个 top-k 在本 rank 时才跳过 reduce
+                // 📌 正常训练(DeepSeek-V3): kUseExpandedLayout=true, kAllowMultipleReduction=true
+                //   → 只有1个 top-k 在本 rank → no_local_reduce=true → 走 Mode 1 (最常见)
+                //   → 多个 top-k 在本 rank → no_local_reduce=false → 走 Mode 2
+                //   → Mode 3 在 kAllowMultipleReduction=false 时才进入, 正常训练不会走
                 auto no_local_reduce = not kUseExpandedLayout or (kAllowMultipleReduction and __popc(reduce_valid_mask) == 1);
                 if (no_local_reduce) {
                     // ── Mode 1: 直接 load+store, 无本地 reduce ──
                     //   展开: token_idx_in_tensor = topk_slot_idx (从 master lane 广播)
                     //   不展开: token_idx_in_tensor = token_idx
+                    // 📌 正常训练最常走的路径: 大多数 token 只有1个 top-k 落在本 rank, 无需 reduce
                     int token_idx_in_tensor = token_idx;
                     if constexpr (kUseExpandedLayout)
                         token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
 
                     // TMA load: x[token_idx_in_tensor] → smem (tma_buffer)
                     if (ptx::elect_one_sync()) {
-                        const auto load_ptr =
-                            math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
+                        const auto load_ptr = math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
                         ptx::tma_store_wait();
                         ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
                     }
                     __syncwarp();
+
                 } else if constexpr (kAllowMultipleReduction) {
+
                     // ── Mode 2: 本地 reduce (展开 + 多 top-k 在本 rank) ──
+                    // 📌 正常训练: 本 token 有多个 top-k 落在同一 rank 时走此路径, 需要加权求和
                     //   1. compute_topk_slots: 将有效的 top-k slot 排序到数组前部
                     //   2. combine_reduce: 从 x[topk_slot_k] 加权求和 → smem
+                    
+                    // ⚠️ 把 reduce_valid_mask 中的有效 lane 的 stored_topk_slot_idx值 收集到 topk_slot_idx 数组中
+                    // 📌 compute_topk_slots (定义在 combine_utils.cuh):
+                    //   输入: mask=reduce_valid_mask, fetch_func=exchange(stored_topk_slot_idx, lane_idx)
+                    //   逻辑: 逐个提取 mask 中最低位的1 → 得到 lane 编号 → exchange 获取该 lane 的 slot → 存入数组 → 清除该 bit
+                    //   举例: reduce_valid_mask=0b10110 (lane1,2,4有效)
+                    //     k=0: lowest=1, fetch lane1的slot → topk_slot_idx[0], mask=0b10100
+                    //     k=1: lowest=2, fetch lane2的slot → topk_slot_idx[1], mask=0b10000
+                    //     k=2: lowest=4, fetch lane4的slot → topk_slot_idx[2], mask=0b00000
+                    //   本质: 把 bitmap 展开成有序数组, 供后续 combine_reduce 逐个 load 并加权求和
                     int topk_slot_idx[kNumTopk];
                     compute_topk_slots(
                         topk_slot_idx, reduce_valid_mask,
@@ -490,6 +512,24 @@ hybrid_combine_impl(
                     );
 
                     // Reduce 结果写入 smem (tma_buffer)
+                    // 📌 combine_reduce (定义在 combine_utils.cuh): 多 top-k 加权求和
+                    //   模板参数:
+                    //     kHiddenVec   = hidden维度的向量数 (kNumHiddenBytes / sizeof(vec_t))
+                    //     kUnrollFactor= 循环展开因子 (由 get_max_unroll_factor 计算, 最大4)
+                    //     kNumExpectedTopk = ceil(kNumTopk / kNumRanks), 预期每个rank平均收到的top-k数
+                    //   函数参数:
+                    //     lane_idx              : 当前 lane 编号, 用于计算 smem 写入偏移
+                    //     topk_slot_idx         : 有效 top-k 的 slot 索引数组 (compute_topk_slots 的输出)
+                    //     dst_buffer_ptr        : smem 目标地址 (tma_buffer), reduce 结果写入此处
+                    //     get_src_buffer_ptr_func: 回调, 给定 slot_idx → 返回 x 中对应 token 的指针
+                    //       此处实现: advance_ptr(x, slot_idx * kNumHiddenBytes)
+                    //     wait_buffer_func      : 回调, 等待 smem buffer 释放 (tma_store_wait + syncwarp)
+                    //   核心逻辑:
+                    //     对每个 hidden 维度的 chunk:
+                    //       1. 遍历 topk_slot_idx, 从 x[slot_k] load 每个 top-k 的 hidden state
+                    //       2. 累加到 reduced[] (FP32 精度), 可选加 bias
+                    //       3. FP32→BF16 转换, 写入 dst_buffer_ptr (smem)
+                    //     优化: 若只有 ≤2 个 top-k 且无 bias, 走 hadd_bypass 路径, 直接用 BF16 加法避免 FP32 转换
                     constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
                     combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumRanks)>(
                         lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
@@ -504,9 +544,12 @@ hybrid_combine_impl(
                     );
                     ptx::tma_store_fence();
                     __syncwarp();
+                    
                 } else {
+
                     // ── Mode 3: 展开发送 (展开 + 不允许多次 reduce) ──
                     //   每个 top-k 分别: TMA load x[slot_k] → smem → TMA store → rank_k 的 buffer
+                    // 📌 正常训练不会走此路径: 仅在 kAllowMultipleReduction=false 时进入
                     //   每个 top-k 对应不同的目标 rank
                     #pragma unroll
                     for (int k = 0; k < kNumTopk; ++ k) {
@@ -536,6 +579,7 @@ hybrid_combine_impl(
                     }
                 }
 
+
                 // ── 写入 top-k 权重 (仅非展开模式) ──
                 //   展开: 不需要权重 (每个 top-k 独立一行)
                 //   非展开: 需要将权重随数据一起发送, 供对端 reduce
@@ -546,6 +590,7 @@ hybrid_combine_impl(
                 }
                 __syncwarp();
 
+                
                 // ── 发起 TMA store: smem → 对端 rank 的 scaleup buffer ──
                 //   Mode 3 (expanded_send) 已经在上面逐 top-k 发出了
                 //   Mode 1/2: 这里统一发起一次 TMA store
