@@ -199,10 +199,12 @@ hybrid_combine_impl(
     auto scaleup_buffer = layout::BufferLayout<false>(
         token_layout, kNumTokensInScaleupLayout, kNumScaleoutRanks * kNumMaxTokensPerRank,
         buffer);
+    // ⚠️ scaleout_recv_buffer
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         token_layout, kNumTokensInScaleoutLayout, kNumMaxTokensPerRank,
         scaleup_buffer.get_buffer_end_ptr());
-    // ⚠️ scaleout_recv_buffer: 跨节点 rank 通过 RDMA put 写入的数据, 本 rank 从这里读取
+
+    // ⚠️ scaleout_send_buffer: 跨节点 rank 通过 RDMA put 写入的数据, 本 rank 从这里读取
     auto scaleout_send_buffer = layout::BufferLayout<false>(
         token_layout, kAllowMultipleReduction ? 1 : kNumTopk, kNumChannels * (kNumScaleoutRanks * kNumMaxTokensPerChannel),
         scaleout_recv_buffer.get_buffer_end_ptr());
@@ -653,6 +655,8 @@ hybrid_combine_impl(
         //  │   4. 最后: 清理 scaleup tail + scaleout 同步                    │
         //  └──────────────────────────────────────────────────────────────────┘
         //
+
+        // ⚠️ 一个warp负责一个token
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
 
@@ -660,10 +664,10 @@ hybrid_combine_impl(
         if constexpr (kAdjustRegisters)
             ptx::warpgroup_reg_alloc<kNumRegistersForForwardWarps>();
 
-        // 切到本 channel 对应的 scaleout send buffer 子区
+        // ⚠️ 切到本 channel 对应的 scaleout send buffer 子区
         scaleout_send_buffer = scaleout_send_buffer.get_channel_buffer<kNumScaleoutRanks * kNumMaxTokensPerChannel>(channel_idx);
 
-        // token_metadata_at_forward 布局:
+        // ⚠️token_metadata_at_forward 布局:
         //   [kNumChannels, kNumScaleoutRanks*kNumMaxTokensPerChannel+1, kNumForwardMetadataDims]
         //   kNumForwardMetadataDims = 2 + kNumTopk*2
         //     [0]: src_token_global_idx
@@ -675,6 +679,20 @@ hybrid_combine_impl(
         // ── 延迟 RDMA 发射器: 重叠 TMA store 和 RDMA put ──
         //   目的: TMA store 完成后再发起 RDMA, 但延迟一个 token
         //   这样当前 token 的 TMA store 和上一个 token 的 RDMA 可以并行
+        //
+        //   流水线示意:
+        //   token 0: [TMA store]
+        //   token 1:            [TMA store]  +  [RDMA put token 0]   ← 并行
+        //   token 2:                        [TMA store]  +  [RDMA put token 1]
+        //
+        //   flush_last_tma_and_issue_rdma 逻辑:
+        //     1. tma_store_wait(): 等待上一个 TMA store (smem → scaleout send buffer) 完成
+        //     2. 若非本 rank (last_src_scaleout_rank_idx != scaleout_rank_idx): 发起 RDMA put
+        //     3. 若是本 rank: 不需要 RDMA, 数据已在本地
+        //
+        //   调用时机:
+        //     a) combine_reduce 内部: reduce 第一次写入前调用, 确保上一 token TMA 完成 + RDMA 发射
+        //     b) 链表遍历结束后: 强制发射最后一个 token 的 RDMA (延迟队列中还剩一个未发射)
         int last_src_scaleout_rank_idx = -1;
         int last_is_token_last_in_chunk = 0;
         void* last_recv_token_buffer_ptr = nullptr;
@@ -698,13 +716,20 @@ hybrid_combine_impl(
         };
 
         // ── 重放 dispatch: 遍历 token_metadata_at_forward ──
+        // ⚠️ 监控所有scaleup rank的进度，等待接收
+        //    stored_cached_scaleup_tail: 当前scaleup rank通知的进度
+        //    stored_num_tokens_recv: 当前处理的进度
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
+        // ⚠️ 遍历这个channel的所有token
         for (int i = 0; ; ++ i) {
+            // ⚠️ token的源信息
             const auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
             const auto is_token_last_in_chunk = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 1);
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
             const auto src_scaleout_rank_idx = src_rank_idx / kNumScaleupRanks;
             const auto src_token_idx = src_token_global_idx % kNumMaxTokensPerRank;
+
+            // ⚠️token的Forward分发信息：目的rank，目的rank的buffer的slot位置
             auto stored_src_scaleup_rank_idx = lane_idx < kNumTopk ?
                 __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + lane_idx) : -1;
             auto stored_src_slot_idx = lane_idx < kNumTopk ?
@@ -712,6 +737,7 @@ hybrid_combine_impl(
             if (src_token_global_idx < 0)
                 break;
 
+            // ⚠️ 需要等待分发的目的scaleup rank都返还了该toekn，才能进行reduce和发送
             // ── 构建 scaleup rank mask: 哪些 scaleup rank 需要等待 ──
             //   reduce_or 聚合所有 lane 的 scaleup_rank_idx → bitmap
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up peers");
@@ -719,11 +745,13 @@ hybrid_combine_impl(
             const auto scaleup_mask = ptx::reduce_or(
                 stored_src_scaleup_rank_idx >= 0 ?
                 (mask_t(1) << stored_src_scaleup_rank_idx) : mask_t(0));
+            // ⚠️ bool向量记录是哪些scaleup rank
             bool stored_is_scaleup_rank_needed[kNumScaleupRanksPerLane];
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
                 stored_is_scaleup_rank_needed[j] = (scaleup_mask >> (j * 32 + lane_idx)) & 1;
 
+            // ⚠️ 需要等待分发的目的scaleup rank都返还了该toekn，才能进行reduce和发送
             // ── 等待 scaleup tail 就绪: 确保数据已写入 scaleup_buffer ──
             //   stored_num_tokens_recv[j] < stored_cached_scaleup_tail[j]:
             //     已收到的 token 数 < scaleup warp 通知的 tail 位置
@@ -733,6 +761,8 @@ hybrid_combine_impl(
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
                     arrived &= not stored_is_scaleup_rank_needed[j] or stored_num_tokens_recv[j] < stored_cached_scaleup_tail[j];
+                
+                // ⚠️ 全 1 代表：要等待的scaleup rank已经更新tail，都通知我可以去消费了
                 if (ptx::all(arrived))
                     return true;
 
@@ -760,26 +790,27 @@ hybrid_combine_impl(
                 return false;
             });
 
-            // ⚠️ 更新已接收计数
+            // ⚠️ 更新 当前处理的进度  + 1，每个等待的scaleup rank的值都+1
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
                 stored_num_tokens_recv[j] += static_cast<int>(stored_is_scaleup_rank_needed[j]);
             
-            // ────────────── Forward Warp 两种路径 ──────────────
-            //
-            //  ┌───────────────────────────────────────────────────────────────────┐
-            //  │ Path A: kAllowMultipleReduction=false                            │
-            //  │   逐 top-k: TMA load scaleup_buf → TMA store scaleout_buf       │
-            //  │   → RDMA put 到跨节点 rank (非本地)                              │
-            //  │   不做本地 reduce, 每个 top-k 独立发送                             │
-            //  │                                                                 │
-            //  │ Path B: kAllowMultipleReduction=true                             │
-            //  │   combine_reduce() 从 scaleup_buf 聚合多个 top-k → smem         │
-            //  │   → TMA store scaleout_buf → 延迟 RDMA put                      │
-            //  │   本地 reduce 后只发一份, 节省 RDMA 带宽                          │
-            //  └───────────────────────────────────────────────────────────────────┘
-            //
+
             if constexpr (not kAllowMultipleReduction) {
+                // ────────────── Forward Warp 两种路径 ──────────────
+                //
+                //  ┌───────────────────────────────────────────────────────────────────┐
+                //  │ Path A: kAllowMultipleReduction=false                            │
+                //  │   逐 top-k: TMA load scaleup_buf → TMA store scaleout_buf       │
+                //  │   → RDMA put 到跨节点 rank (非本地)                              │
+                //  │   不做本地 reduce, 每个 top-k 独立发送                             │
+                //  │                                                                 │
+                //  │ Path B: kAllowMultipleReduction=true                             │
+                //  │   combine_reduce() 从 scaleup_buf 聚合多个 top-k → smem         │
+                //  │   → TMA store scaleout_buf → 延迟 RDMA put                      │
+                //  │   本地 reduce 后只发一份, 节省 RDMA 带宽                          │
+                //  └───────────────────────────────────────────────────────────────────┘
+                //
                 // ── Path A: 逐 top-k 转发, 无本地 reduce ──
                 const auto src_slot_idx = src_scaleout_rank_idx * kNumMaxTokensPerRank + src_token_idx;
                 auto topk_valid_mask = kUseExpandedLayout ?
@@ -798,10 +829,13 @@ hybrid_combine_impl(
                         ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, token_layout.get_num_bytes<false>());
                         ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
 
+
                         // ⚠️ TMA store from smem → scaleout_buf (recv or send)
                         //   本地 rank: 直接写到 recv_buffer (无需 RDMA)
                         //   跨节点 rank: 写到 send_buffer (后续 RDMA put)
+                        // ⚠️ （token_layout, kNumTokensInScaleoutLayout, kNumMaxTokensPerRank）
                         const auto recv_buffer_ptr = scaleout_recv_buffer.get_rank_buffer(k).get_token_buffer(src_token_idx).get_base_ptr();
+                        // ⚠️ （kAllowMultipleReduction ? 1 : kNumTopk, kNumChannels * (kNumScaleoutRanks * kNumMaxTokensPerChannel)）
                         const auto send_buffer_ptr = src_scaleout_rank_idx == scaleout_rank_idx ?
                             recv_buffer_ptr : scaleout_send_buffer.get_rank_buffer(k).get_token_buffer(i).get_base_ptr();
                         ptx::tma_store_1d(send_buffer_ptr, tma_buffer.get_base_ptr(), token_layout.get_num_bytes<false>());
@@ -823,7 +857,19 @@ hybrid_combine_impl(
                     }
                 }
                 __syncwarp();
+            
+            
             } else {
+                    // ────────────── Forward Warp 两种路径 ──────────────
+                //
+                //  ┌───────────────────────────────────────────────────────────────────┐
+                //  │                                                                   │
+                //  │ Path B: kAllowMultipleReduction=true                              │
+                //  │   combine_reduce() 从 scaleup_buf 聚合多个 top-k → smem            │
+                //  │   → TMA store scaleout_buf → 延迟 RDMA put                        │
+                //  │   本地 reduce 后只发一份, 节省 RDMA 带宽                            │
+                //  └───────────────────────────────────────────────────────────────────┘
+                //
                 // ── Path B: 本地 reduce + RDMA 转发 ──
                 //   去重: 多个 top-k 可能来自同一 scaleup rank, 只需读一次
                 //   reduce: combine_reduce() 聚合多个 top-k 的 hidden states
@@ -841,7 +887,7 @@ hybrid_combine_impl(
                         lane_idx * scaleup_buffer.num_max_tokens_per_rank + src_slot_idx;
                 }
                 
-                // ⚠️ 预处理 top-k 索引: 排序有效索引到数组前部
+                // ⚠️ 收集每个stored_src_buffer_idx的信息到topk_slot_idx ===> 因为需要整个warp一起运数据
                 int topk_slot_idx[kNumTokensInScaleupLayout];
                 compute_topk_slots(
                     topk_slot_idx, reduce_valid_mask,
@@ -850,11 +896,35 @@ hybrid_combine_impl(
                     }
                 );
 
+                
+                //
+                // get_max_unroll_factor<kHiddenVec, kAdjustRegisters ? 8 : 4>():
+                //   找最大的展开因子 i, 使得 kHiddenVec % (32 * i) == 0
+                //   kAdjustRegisters=true  → 上限4, 节省寄存器 (forward warp 需要更多)
+                //   kAdjustRegisters=false → 上限8, 最大展开以提升吞吐
+                //   例: kHiddenVec=448, 上限8 → 448%(32*7=224)=0 → 返回7; 上限4 → 448%(32*4=128)=0 → 返回4
+                //
+                // combine_reduce 模板参数:
+                //   kHiddenVec        : hidden 维度的向量数 (kHidden * sizeof(bf16) / sizeof(vec_t))
+                //   kUnrollFactor     : 循环展开因子, 每个 lane 一次迭代处理 kUnrollFactor 个向量
+                //   kNumExpectedTopk  : ceil(kNumTopk / kNumScaleoutRanks), 优化分支
+                //
+                // combine_reduce 入参:
+                //   lane_idx          : 当前 lane 索引
+                //   topk_slot_idx     : 每个 top-k 对应的 buffer 槽位索引 (-1=无效)
+                //   dst_buffer_ptr    : 目标 buffer (TMA buffer, smem)
+                //   get_src_buffer_ptr_func: slot_idx → scaleup_buffer 中对应 token 的指针
+                //   wait_buffer_func : 等待 buffer 就绪 (flush_last_tma_and_issue_rdma)
+                //
+                // 核心逻辑分两条路径:
+                //   enable_hadd_bypass (≤2 个有效 top-k 且无 bias): 直接 BF16 加法, 无需转 float, 更快
+                //   常规路径: 先转 float 累加 (精度更好), 再转回 BF16 写入 dst
                 // ⚠️ combine_reduce: 从 scaleup_buffer 多个 top-k 位置加权求和 → smem
                 constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, kAdjustRegisters ? 8 : 4>();
                 combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumScaleoutRanks)>(
                     lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
                     /* Get source base */ [=](const int& slot_idx) {
+                        // global=true: slot_idx 是跨 rank 全局索引, 绕过 num_ranks==1 断言
                         return static_cast<combine_vec_t*>(scaleup_buffer.get_token_buffer(slot_idx, true).get_base_ptr());
                     },
                     /* Wait buffer release */ [=]() {
@@ -862,8 +932,12 @@ hybrid_combine_impl(
                     }
                 );
 
-                // ⚠️ 合并 topk weights: 从 scaleup_buffer 中读取权重到 smem
-                //   slot indices 必须跟随 master lane (match + exchange 同步)
+                // 1. ptx::match(stored_src_scaleup_rank_idx) — 返回一个 bitmap，标记哪些 lane 的 stored_src_scaleup_rank_idx 与当前 lane 值相同
+                // 2. ptx::get_master_lane_idx(...) — 从 bitmap 中取最高位索引（31 - __clz(mask)），即相同 rank 的 lane 中编号最大的那个作为 "master lane"
+                // 3. ptx::exchange(stored_src_buffer_idx, master_lane_idx) — 从 master lane 广播 stored_src_buffer_idx 到所有同 rank 的 lane
+                // ⚠️效果：同一个 scaleup rank 的多个 lane，统一采用 master lane 的 stored_src_buffer_idx，确保后续访问 scaleup buffer 时同一 rank 的所有 lane 读同一个 slot。
+                // ⚠️为什么需要：一个 token 可能有多个 top-k 来自同一个 scaleup rank，但 reduce 时这些 top-k 已被合并，只需要读一个 slot。master lane 的 stored_src_buffer_idx 是 combine_reduce 产出的统一 slot 索引，其他同 rank 的 lane 必须与之对齐。
+                // 并非多次一举，是因为Hybrid dispatch中对于非master lane保留的stored_src_slot_idx=-1
                 stored_src_buffer_idx = ptx::exchange(
                     stored_src_buffer_idx, ptx::get_master_lane_idx(ptx::match(stored_src_scaleup_rank_idx)));
                 if (not kUseExpandedLayout and stored_src_scaleup_rank_idx >= 0) {
@@ -873,6 +947,7 @@ hybrid_combine_impl(
                 }
                 ptx::tma_store_fence();
                 __syncwarp(); // Necessary to let the leader lane see the writes
+
 
                 // ⚠️ 确定 send/recv buffer: reduce 结果写入哪里?
                 //   kUseScaleoutRankLayout: 按 scaleout rank 索引选 buffer
@@ -885,7 +960,9 @@ hybrid_combine_impl(
                     const int src_topk_idx = ptx::get_master_lane_idx(ptx::gather(stored_src_scaleup_rank_idx >= 0));
                     scaleout_recv_buffer_rank_idx = src_topk_idx;
                 }
+                // ⚠️ （token_layout, kNumTokensInScaleoutLayout, kNumMaxTokensPerRank）
                 const auto recv_token_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_recv_buffer_rank_idx).get_token_buffer(src_token_idx);
+                // ⚠️ （kAllowMultipleReduction ? 1 : kNumTopk, kNumChannels * (kNumScaleoutRanks * kNumMaxTokensPerChannel)）
                 const auto send_token_buffer = src_scaleout_rank_idx == scaleout_rank_idx ?
                     recv_token_buffer :
                     scaleout_send_buffer.get_token_buffer(i);

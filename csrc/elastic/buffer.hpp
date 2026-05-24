@@ -628,6 +628,73 @@ public:
         return std::max(num_dispatch_bytes, num_combine_bytes);
     }
 
+    // ============================================================================================
+    //  ElasticBuffer::dispatch —— Token 分发入口
+    // ============================================================================================
+    //
+    //  【总览】
+    //  将 token 按 top-k 路由分发到各 rank 的 buffer 中, 供 expert 计算。
+    //  支持单节点 (NVLink) 和多节点 (NVLink + RDMA) 混合拓扑。
+    //
+    //  【整体流程】
+    //
+    //  ┌──────────────────────────────────────────────────────────────────────────────────┐
+    //  │ 1. 参数校验 + 张量分配                                                           │
+    //  │ 2. (确定性模式) launch_dispatch_deterministic_prologue                            │
+    //  │ 3. launch_dispatch / launch_hybrid_dispatch (主通信 kernel)                       │
+    //  │    → 各 rank 将 token 写入对端 buffer, 并记录 rank_count / expert_count          │
+    //  │ 4. (do_cpu_sync) CPU 轮询 host_workspace 等待所有 rank 数据就绪                   │
+    //  │    (cached_mode) 直接使用缓存的计数值                                             │
+    //  │    (否则) 分配最坏情况大小                                                       │
+    //  │ 5. 分配输出张量 (recv_x, recv_sf, recv_topk_idx, ...)                           │
+    //  │ 6. launch_dispatch_copy_epilogue (PDL epilogue, 从 buffer 拷贝到输出张量)        │
+    //  │ 7. stream_control_epilogue (流同步)                                             │
+    //  └──────────────────────────────────────────────────────────────────────────────────┘
+    //
+    //  【返回值】
+    //  ┌───────────────────────────────────────────────────────────────────┐
+    //  │ recv_x          : [num_allocated_tokens, hidden] 接收到的 hidden  │
+    //  │ recv_sf         : (可选) [num_allocated_tokens, num_sf_packs] SF   │
+    //  │ recv_topk_idx   : (可选) [num_allocated_tokens, num_topk] topk索引│
+    //  │ recv_topk_weights: (可选) topk权重                               │
+    //  │ copied_topk_idx : (可选) topk_idx副本 (防止用户修改)              │
+    //  │ num_recv_tokens_per_expert_list: 每个本地expert收到的token数      │
+    //  │ psum_num_recv_tokens_per_scaleup_rank: [num_scaleup_ranks] 前缀和 │
+    //  │ psum_num_recv_tokens_per_expert: [num_local_experts] 前缀和       │
+    //  │ recv_src_metadata: [num_recv_tokens, num_topk+2] 源元数据        │
+    //  │ dst_buffer_slot_idx: 目标buffer slot索引                         │
+    //  │ token_metadata_at_forward: (混合模式) forward元数据               │
+    //  │ channel_linked_list: (混合模式) 通道链表                          │
+    //  │ event           : 流同步事件                                     │
+    //  └───────────────────────────────────────────────────────────────────┘
+    //
+    //  【入参详解】
+    //  x                              : [num_tokens, hidden] 输入token, BF16或FP8
+    //  sf                             : (FP8模式) [num_tokens, num_sf_packs] scale factors
+    //  topk_idx                       : [num_tokens, num_topk] 每个token选择的expert索引
+    //  topk_weights                   : [num_tokens, num_topk] 每个top-k的权重 (训练backward可选)
+    //  cumulative_local_expert_recv_stats: (可选) [num_local_experts] 累计接收计数
+    //  cached_num_recv_tokens         : (缓存模式) 缓存的总接收token数
+    //  cached_num_recv_tokens_per_expert_list: (缓存模式) 缓存的每expert接收数
+    //  cached_psum_num_recv_tokens_per_scaleup_rank: (缓存模式) 缓存的scaleup前缀和
+    //  cached_psum_num_recv_tokens_per_expert: (缓存模式) 缓存的expert前缀和
+    //  cached_dst_buffer_slot_idx     : (缓存模式) 缓存的目标slot索引
+    //  cached_token_metadata_at_forward: (缓存模式/混合) 缓存的forward元数据
+    //  cached_channel_linked_list     : (缓存模式/混合) 缓存的通道链表
+    //  num_max_tokens_per_rank        : 每rank最大token容量
+    //  num_experts                    : 总expert数
+    //  expert_alignment               : expert对齐要求 (expand模式用)
+    //  num_sms                        : 使用的SM数
+    //  num_qps                        : RDMA QP数
+    //  previous_event                 : (流控制) 前一个事件
+    //  previous_event_before_epilogue  : (流控制) epilogue前的事件
+    //  async_with_compute_stream      : 是否与compute流异步
+    //  allocate_on_comm_stream        : 是否在comm流上分配
+    //  do_handle_copy                 : 是否拷贝topk_idx (防止用户修改)
+    //  do_cpu_sync                    : CPU是否同步等待dispatch完成
+    //  do_expand                      : 是否展开 (每个top-k占独立行)
+    //  use_tma_aligned_col_major_sf   : 是否用TMA对齐的列主序SF布局
+    //
     std::tuple<torch::Tensor, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
@@ -656,10 +723,12 @@ public:
              const bool& allocate_on_comm_stream,
              const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
              const bool& use_tma_aligned_col_major_sf) const {
-        // Check SM count
+        // ── 1. 基本校验 ──
         EP_HOST_ASSERT(num_sms > 0);
 
-        // Cached mode must have responding handles
+        // ── 2. 缓存模式校验 ──
+        //   cached_mode: 重用上一轮 dispatch 的路由信息, 跳过 GPU 计数 + CPU 同步
+        //   要求: 所有 cached_* 张量都已提供 (混合模式还需 token_metadata + linked_list)
         const bool cached_mode = cached_num_recv_tokens.has_value();
         if (cached_mode) {
             EP_HOST_ASSERT(cached_num_recv_tokens.has_value());
@@ -675,7 +744,9 @@ public:
             }
         }
 
-        // Check data tensor
+        // ── 3. 输入张量校验 ──
+        //   x: [num_tokens, hidden], 必须CUDA + contiguous + int4对齐
+        //   num_local_experts = 总expert / rank数 (每个rank负责的expert数)
         const auto [num_tokens, hidden] = get_shape<2>(x);
         const auto num_hidden_bytes = hidden * static_cast<int>(x.element_size());
         const auto num_local_experts = num_experts / nccl_context->num_ranks;
@@ -683,7 +754,9 @@ public:
         EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
         EP_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
 
-        // Check SF stuffs
+        // ── 4. Scale Factor (FP8模式) 校验 ──
+        //   sf: [num_tokens, num_sf_packs], 类型为 sf_pack_t (packed UE8M0x4)
+        //   sf_token_stride / sf_hidden_stride: 支持非连续布局 (如TMA对齐列主序)
         int num_sf_packs = 0;
         void* sf_ptr = nullptr;
         int sf_token_stride = 0, sf_hidden_stride = 0;
@@ -699,7 +772,9 @@ public:
             sf_hidden_stride = sf->stride(1);
         }
 
-        // Check top-k stuffs
+        // ── 5. Top-k 索引 + 权重校验 ──
+        //   topk_idx: [num_tokens, num_topk], int类型, 每个lane选择哪个expert
+        //   topk_weights: (可选, 训练backward) [num_tokens, num_topk], float
         const auto [num_tokens_, num_topk] = get_shape<2>(topk_idx);
         EP_HOST_ASSERT(num_tokens == num_tokens_);
         EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
@@ -714,7 +789,9 @@ public:
             topk_weights_ptr = topk_weights->data_ptr<float>();
         }
 
-        // Expert receiving counter
+        // ── 6. Expert接收计数器校验 ──
+        //   cumulative_local_expert_recv_stats: (可选) [num_local_experts]
+        //   用于 MoE 负载均衡 loss 的累计统计
         int* cumulative_local_expert_recv_stats_ptr = nullptr;
         if (cumulative_local_expert_recv_stats.has_value()) {
             const auto [num_local_experts_] = get_shape<1>(cumulative_local_expert_recv_stats.value());
@@ -724,12 +801,21 @@ public:
             cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
         }
 
-        // Stream control
-        // All new tensor allocations should happen after this
+        // ── 7. 流控制 prologue ──
+        //   确保计算流与通信流的正确同步关系
+        //   所有后续张量分配必须在此之后 (避免流竞争)
         const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
 
-        // The number of received tokens per expert
-        // This is useful for expanding mode
+        // ── 8. 分配 prefix sum 张量 ──
+        //
+        //   psum_num_recv_tokens_per_expert: [num_local_experts+1] 或 [num_local_experts]
+        //     expand模式: exclusive prefix sum (长度=num_local_experts, 同时作为atomic counter)
+        //     非expand模式: inclusive prefix sum (长度=num_local_experts)
+        //     初始分配 num_local_experts+1 是因为 kernel 写入 inclusive + exclusive 两种
+        //
+        //   psum_num_recv_tokens_per_scaleup_rank: [num_scaleup_ranks]
+        //     inclusive prefix sum: 每个 scaleup rank 收到的 token 累计
+        //     供 combine 阶段定位 buffer 边界 (也作为 dispatch handle)
         EP_HOST_ASSERT(num_experts % nccl_context->num_ranks == 0);
         auto psum_num_recv_tokens_per_expert = cached_psum_num_recv_tokens_per_expert.value_or(torch::Tensor());
         if (cached_mode) {
@@ -756,8 +842,15 @@ public:
                 {nccl_context->num_scaleup_ranks}, at::TensorOptions(torch::kCUDA).dtype(torch::kInt));
         }
 
-        // Decide number of channels by shared memory consumption
-        // Only for hybrid version
+        // ── 9. 混合模式: 计算 channel 数 ──
+        //
+        //   channel = SM × channel_per_SM, 是数据并行的基本调度单位
+        //   channel_per_SM 受限于:
+        //     a) dispatch token 在 smem 中的大小 → (smem - notify区) / dispatch_token_size
+        //     b) combine token 在 smem 中的大小 → smem / combine_token_size
+        //     c) warp 种类数 (scaleup + forward = 2种) → channels_per_sm / 2
+        //     d) 最大限制 kNumMaxChannelsPerSM=8
+        //   prefer_overlap_with_compute=false → 限制最多4 (留SM给计算)
         int num_channels_per_sm = 1, num_channels = 1;
         const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
         if (nccl_context->num_scaleout_ranks > 1) {
@@ -779,7 +872,11 @@ public:
                 printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
         }
 
-        // Non-hybrid mode handles
+        // ── 10. 非混合模式: 分配 dst_buffer_slot_idx ──
+        //   形状: [num_tokens, num_topk]
+        //   含义: 每个 token 的每个 top-k 在目标 rank buffer 中的 slot 编号
+        //   确定性模式: 先运行 prologue kernel 预计算 slot
+        //   非确定性: 直接分配, 由 dispatch kernel 内部 atomicAdd 分配
         std::optional<torch::Tensor> deterministic_rank_count_buffer = std::nullopt;
         auto dst_buffer_slot_idx = cached_dst_buffer_slot_idx.value_or(torch::Tensor());
         if (nccl_context->num_scaleout_ranks == 1) {
@@ -815,7 +912,23 @@ public:
             }
         }
 
-        // Hybrid mode handles
+        // ── 11. 混合模式: 分配元数据张量 ──
+        //
+        //   dst_buffer_slot_idx: [num_channels, num_scaleout_ranks, num_max_tokens_per_channel, num_topk]
+        //     每 channel × 每 scaleout peer × 每 token × 每 top-k 的目标 slot
+        //
+        //   token_metadata_at_forward: [num_channels, num_max_forwarded_tokens, num_forward_metadata_dims]
+        //     num_forward_metadata_dims = 2 + num_topk * 2:
+        //       [0]: src_token_global_idx (token 在原始 rank 中的全局索引)
+        //       [1]: is_token_last_in_chunk (是否是该 scaleout chunk 的最后一个 token)
+        //       [2..2+num_topk-1]: src_scaleup_rank_idx[k] (每个 top-k 的来源 scaleup rank)
+        //       [2+num_topk..2+2*num_topk-1]: src_slot_idx[k] (每个 top-k 在 scaleup buffer 的 slot)
+        //     供 combine forward warp 重放
+        //
+        //   channel_linked_list: [num_channels, num_scaleout_ranks*num_max_tokens_per_channel+1, num_scaleup_ranks]
+        //     每 channel × 每 token 位置 × 每 scaleup rank 的链表指针
+        //     [c, 0, r] = 链表头, [c, i, r] = 下一个节点 (0=终止)
+        //     供 combine scaleup warp 遍历
         std::optional<torch::Tensor> token_metadata_at_forward, channel_linked_list;
         int *token_metadata_at_forward_ptr = nullptr, *channel_linked_list_ptr = nullptr;
         if (nccl_context->num_scaleout_ranks > 1) {
@@ -887,7 +1000,7 @@ public:
             channel_linked_list_ptr = channel_linked_list->data_ptr<int>();
         }
 
-        // Clone `topk_idx` for saving in the handle (to prevent users' modification)
+        // ── 12. 拷贝 topk_idx (防止用户在 combine 前修改) ──
         auto copied_topk_idx = std::optional<torch::Tensor>();
         topk_idx_t* copied_topk_idx_ptr = nullptr;
         if (do_handle_copy and not cached_mode) {
@@ -895,13 +1008,16 @@ public:
             copied_topk_idx_ptr = copied_topk_idx->data_ptr<topk_idx_t>();
         }
 
-        // Check buffer size
+        // ── 13. 校验 buffer 大小是否足够 ──
         EP_HOST_ASSERT(get_dispatch_buffer_size(
                        num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
                        nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
                        nccl_context->is_scaleup_nvlink) <= num_buffer_bytes);
 
-        // Ready and clean host workspace for this round
+        // ── 14. 清零 host workspace ──
+        //   host_workspace: CPU 可见的映射内存, GPU kernel 通过 st.release.sys 写入
+        //   清零 rank_count 和 expert_count, 为本轮 dispatch 准备
+        //   atomic_thread_fence(seq_cst): 确保 CPU 写入在 GPU 读取前可见
         const auto host_workspace_layout = layout::WorkspaceLayout(
             host_workspace,
             nccl_context->num_scaleout_ranks,
@@ -911,7 +1027,11 @@ public:
         std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
-        // Do dispatch into the buffers (with SM limitation)
+        // ── 15. 启动主 dispatch kernel ──
+        //   launch_dispatch 内部根据 num_scaleout_ranks 选择:
+        //     == 1 → dispatch_impl (单节点, NVLink)
+        //     >  1 → hybrid_dispatch_impl (混合, NVLink + RDMA)
+        //   kernel 写入对端 buffer + 更新 host_workspace 的 rank/expert 计数
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
@@ -937,22 +1057,28 @@ public:
                         cached_mode, deterministic, do_cpu_sync,
                         comm_stream);
 
-        // Received token counters
+        // ── 16. 获取接收 token 计数 ──
+        //   三种模式:
+        //   a) cached_mode: 直接用缓存值 (跳过 CPU 同步)
+        //   b) do_cpu_sync: CPU 轮询 host_workspace, 等待 GPU kernel 写入 rank/expert 计数
+        //      encode_decode_positive: GPU 写入时编码正值, CPU 解码并检查是否就绪
+        //      is_decoded_positive_ready: 值 > 0 表示该 rank/expert 已完成
+        //   c) 默认: 分配最坏情况 (num_max_tokens_per_rank * num_ranks)
         int num_recv_tokens = 0, num_expanded_tokens = 0;
         int counter_scaleup_rank_idx = 0, counter_local_expert_idx = 0;
         std::vector<int> num_recv_tokens_per_expert_list;
 
         // Assign these values according to modes
         if (cached_mode) {
-            // Cached mode
-            // TODO: support to expand for MoE training backward with cached handles from non-expanding forward,
-            // which requires maintaining the same expanding order between forward and backward
             EP_HOST_ASSERT(not do_expand and "Cannot do expand with cached mode");
             EP_HOST_ASSERT(not do_cpu_sync and "Cannot do CPU sync with cached mode");
             num_recv_tokens = cached_num_recv_tokens.value();
             num_recv_tokens_per_expert_list = cached_num_recv_tokens_per_expert_list.value();
         } else if (do_cpu_sync) {
-            // Non-cached mode with sync
+            // ── CPU 同步模式: 轮询 host_workspace 等待所有数据就绪 ──
+            //   host_workspace 由 GPU kernel 通过 st.release.sys 写入 (release 语义保证可见性)
+            //   CPU 端循环读取, 直到所有 scaleup rank 和 expert 的计数都已就绪
+            //   超时则抛异常
             const auto start_cpu_time = std::chrono::high_resolution_clock::now();
             while (true) {
                 bool ready = true;
@@ -1000,15 +1126,29 @@ public:
                     throw EPExceptionWithLineInfo("Dispatch CPU wait", get_buffer_info());
             }
         } else {
-            // Non-cached mode without CPU sync, allocate with the worst case
+            // ── 非缓存非同步模式: 按最坏情况分配 ──
+            //   无法提前知道实际接收多少 token, 按 max 分配
+            //   num_recv_tokens = 所有 rank 各发 max 个
+            //   num_expanded_tokens = 所有 rank × min(topk, local_experts) × max_tokens + 对齐
             num_recv_tokens = num_max_tokens_per_rank * nccl_context->num_ranks;
             num_expanded_tokens = nccl_context->num_ranks * num_max_tokens_per_rank * std::min(num_topk, num_local_experts);
             num_expanded_tokens += (expert_alignment - 1) * num_local_experts;
             num_expanded_tokens = math::align(num_expanded_tokens, expert_alignment);
         }
 
-        // Allocate received tensors
-        // `recv_src_metadata` includes source token indices and buffer slot indices
+        // ── 17. 分配输出张量 ──
+        //
+        //   recv_x: [num_allocated_tokens, hidden] 接收到的 hidden states
+        //   recv_sf: (FP8) [num_allocated_tokens, num_sf_packs] scale factors
+        //     两种布局:
+        //       默认: 行主序 (token_stride=num_sf_packs, hidden_stride=1)
+        //       TMA对齐列主序: (token_stride=1, hidden_stride=align(tokens, kNumAlignedSFPacks))
+        //         → 适配后续 GEMM 的 TMA 加载
+        //   recv_topk_idx: (非expand) [num_allocated_tokens, num_topk]
+        //   recv_topk_weights: expand→[num_allocated_tokens], 非→[num_allocated_tokens, num_topk]
+        //   recv_src_metadata: [num_recv_tokens, num_topk+2]
+        //     [0]: src_token_global_idx, [1]: src_rank_idx, [2..+num_topk]: buffer slot indices
+        //     供 combine 阶段定位 token 来源
         const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
         auto recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
         auto recv_sf = std::optional<torch::Tensor>();
@@ -1046,7 +1186,10 @@ public:
             recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
         }
 
-        // Process prefix sum, in expanding mode, it is also atomic counters
+        // ── 18. 处理 prefix sum 切片 ──
+        //   expand模式: 使用 exclusive prefix sum (长度=num_local_experts, 作为atomic counter)
+        //   非expand非缓存: 使用 inclusive prefix sum (切片去掉第0个元素)
+        //   缓存模式: 已由缓存提供, 不动
         if (do_expand) {
             // Slice and exclusive part and do atomic additions into inclusive
             EP_HOST_ASSERT(not cached_mode);
@@ -1057,7 +1200,11 @@ public:
         }
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
-        // Launch copy kernels with full SMs
+        // ── 19. 启动 dispatch copy epilogue kernel (PDL) ──
+        //   从 GPU buffer 拷贝到输出张量 (recv_x, recv_sf, recv_topk_idx, ...)
+        //   使用全量 SM (非限制 num_sms, 因为是纯拷贝无通信)
+        //   通过 PDL (Programmatic Dependent Launch) 与主 dispatch kernel 流水重叠
+        //   stream_control_before_epilogue: 确保在 epilogue 前同步
         stream_control_before_epilogue(previous_event_before_epilogue);
         launch_dispatch_copy_epilogue(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
@@ -1107,6 +1254,51 @@ public:
                 event};
     }
 
+    // ============================================================================================
+    //  ElasticBuffer::combine —— Token 合并入口
+    // ============================================================================================
+    //
+    //  【总览】
+    //  Combine 是 Dispatch 的逆过程: 将各 expert 处理后的 hidden states 按 top-k 权重加权求和,
+    //  还原为完整的 token 表示。
+    //
+    //  【整体流程】
+    //
+    //  ┌──────────────────────────────────────────────────────────────────────────────────┐
+    //  │ 1. 参数校验 + 张量校验                                                          │
+    //  │ 2. launch_combine / launch_hybrid_combine (主通信 kernel, 阶段1)                  │
+    //  │    → 各 rank 将 hidden states 推送到对端, 局部 reduce                             │
+    //  │    → 数据写入 reduce_buffer                                                      │
+    //  │ 3. 分配输出张量 (combined_x, combined_topk_weights)                              │
+    //  │ 4. launch_combine_reduce_epilogue (PDL epilogue, 阶段2)                          │
+    //  │    → 从 reduce_buffer 读取, 最终 top-k 加权求和 + 可选 SwiGLU bias               │
+    //  │    → 写回 combined_x                                                             │
+    //  │ 5. stream_control_epilogue (流同步)                                             │
+    //  └──────────────────────────────────────────────────────────────────────────────────┘
+    //
+    //  【返回值】
+    //  ┌───────────────────────────────────────────────────────────────────┐
+    //  │ combined_x          : [num_combined_tokens, hidden] 合并后的token  │
+    //  │ combined_topk_weights: (可选) [num_combined_tokens, num_topk] 权重 │
+    //  │ event               : 流同步事件                                  │
+    //  └───────────────────────────────────────────────────────────────────┘
+    //
+    //  【入参详解】
+    //  x                              : [num_tokens, hidden] expert处理后的hidden (BF16)
+    //  topk_weights                   : (可选) [num_tokens, num_topk] top-k权重 (非展开模式)
+    //  bias_0, bias_1                 : (可选) SwiGLU bias [num_combined_tokens, hidden]
+    //  src_metadata                   : [num_reduced_tokens, num_topk+2] dispatch阶段写入的源元数据
+    //  combined_topk_idx             : [num_combined_tokens, num_topk] 每个token的top-k expert索引
+    //  psum_num_recv_tokens_per_scaleup_rank: [num_scaleup_ranks] 来自dispatch的scaleup前缀和
+    //  token_metadata_at_forward      : (混合模式) forward元数据
+    //  channel_linked_list            : (混合模式) 通道链表
+    //  num_experts                    : 总expert数
+    //  num_max_tokens_per_rank        : 每rank最大token容量
+    //  num_sms, num_qps               : SM数和QP数
+    //  previous_event / previous_event_before_epilogue: 流控制事件
+    //  async_with_compute_stream / allocate_on_comm_stream: 流控制选项
+    //  use_expanded_layout            : 是否展开 (每个top-k占独立行, 配合SwiGLU)
+    //
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
     combine(const torch::Tensor& x,
             const std::optional<torch::Tensor>& topk_weights,
@@ -1125,16 +1317,23 @@ public:
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
             const bool& use_expanded_layout) const {
-        // Check SM count
+        // ── 1. 基本校验 ──
         EP_HOST_ASSERT(num_sms > 0);
 
-        // Check data
+        // ── 2. 输入张量校验 ──
+        //   x: [num_tokens, hidden], BF16, CUDA, contiguous
+        //   hidden 必须 int4 对齐 (16B)
         const auto [num_tokens, hidden] = get_shape<2>(x);
         EP_HOST_ASSERT(x.is_cuda() and x.is_contiguous());
         EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
         EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
 
-        // Check tensors at dispatch
+        // ── 3. dispatch handle 校验 ──
+        //   combined_topk_idx: [num_combined_tokens, num_topk]
+        //     num_combined_tokens = 本 rank 需要最终 combine 的 token 数
+        //     来自 dispatch 阶段的 topk_idx (经过 expert 映射后的本地索引)
+        //   psum_num_recv_tokens_per_scaleup_rank: [num_scaleup_ranks]
+        //     dispatch 阶段产出的 inclusive prefix sum
         const auto [num_combined_tokens, num_topk] = get_shape<2>(combined_topk_idx);
         const auto [num_scaleup_ranks] = get_shape<1>(psum_num_recv_tokens_per_scaleup_rank);
         EP_HOST_ASSERT(combined_topk_idx.is_cuda() and combined_topk_idx.is_contiguous());
@@ -1144,17 +1343,20 @@ public:
         EP_HOST_ASSERT(psum_num_recv_tokens_per_scaleup_rank.scalar_type() == torch::kInt);
         EP_HOST_ASSERT(num_combined_tokens <= num_max_tokens_per_rank);
 
-        // Check metadata
-        // For reduction mode, `num_tokens_` means the number of unexpanded tokens
+        // ── 4. src_metadata 校验 ──
+        //   形状: [num_reduced_tokens, num_topk + 2]
+        //   use_expanded_layout=true:  num_reduced_tokens 可以 != num_tokens (每个 top-k 独立行)
+        //   use_expanded_layout=false: num_reduced_tokens 必须 == num_tokens
         const auto [num_reduced_tokens, num_topk_p2] = get_shape<2>(src_metadata);
         EP_HOST_ASSERT(num_reduced_tokens == (use_expanded_layout ? num_reduced_tokens : num_tokens));
         EP_HOST_ASSERT(num_topk_p2 == num_topk + 2);
         EP_HOST_ASSERT(src_metadata.is_cuda() and src_metadata.is_contiguous());
         EP_HOST_ASSERT(src_metadata.scalar_type() == torch::kInt);
 
-        // Check optional tensors
+        // ── 5. 可选张量校验 ──
+        //   use_expanded_layout=true → 不能有 topk_weights (reduce 在 SwiGLU 内完成)
+        //   bias: [num_combined_tokens, hidden], BF16, contiguous
         if (use_expanded_layout) {
-            // Reduction should be done with SwiGLU
             EP_HOST_ASSERT(not topk_weights.has_value());
         } else if (topk_weights.has_value()) {
             const auto [num_tokens__, num_topk__] = get_shape<2>(topk_weights.value());
@@ -1175,16 +1377,17 @@ public:
             }
         }
 
-        // Stream control
-        // All new tensor allocations should happen after this
+        // ── 6. 流控制 prologue ──
         const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
 
-        // Check buffer size
+        // ── 7. 校验 buffer 大小 ──
         EP_HOST_ASSERT(get_combine_buffer_size(num_max_tokens_per_rank, hidden, num_topk,
                                                nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
                                                nccl_context->is_scaleup_nvlink, allow_multiple_reduction) <= num_buffer_bytes);
 
-        // Optional configs and metadata for hybrid combine
+        // ── 8. 混合模式: 从 dispatch handle 恢复 channel 元数据 ──
+        //   token_metadata_at_forward: [num_channels, num_max_forwarded_tokens, 2+num_topk*2]
+        //   channel_linked_list: [num_channels, num_scaleout_ranks*num_max_tokens_per_channel+1, num_scaleup_ranks]
         int num_channels = 1;
         int* token_metadata_at_forward_ptr = nullptr;
         int* channel_linked_list_ptr = nullptr;
@@ -1209,8 +1412,11 @@ public:
             EP_HOST_ASSERT(channel_linked_list->scalar_type() == torch::kInt);
         }
 
-        // Push data into remote buffers
-        // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
+        // ── 9. 启动主 combine kernel (阶段1) ──
+        //   launch_combine 内部根据 num_scaleout_ranks 选择:
+        //     == 1 → combine_impl (单节点, NVLink)
+        //     >  1 → hybrid_combine_impl (混合, NVLink + RDMA)
+        //   返回 reduce_buffer 指针 (供 epilogue 读取)
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
@@ -1231,7 +1437,9 @@ public:
             use_expanded_layout, allow_multiple_reduction,
             comm_stream);
 
-        // Allocate output tensors
+        // ── 10. 分配输出张量 ──
+        //   combined_x: [num_combined_tokens, hidden] 最终合并后的 hidden states
+        //   combined_topk_weights: (可选) [num_combined_tokens, num_topk] top-k 权重
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
         auto combined_topk_weights = std::optional<torch::Tensor>();
         float* combined_topk_weights_ptr = nullptr;
@@ -1240,7 +1448,11 @@ public:
             combined_topk_weights_ptr = combined_topk_weights->data_ptr<float>();
         }
 
-        // Combine pushed data
+        // ── 11. 启动 combine reduce epilogue kernel (阶段2, PDL) ──
+        //   从 reduce_buffer 读取多个 rank 的数据, 做 top-k 加权求和
+        //   可选 SwiGLU bias, TMA store 写回 combined_x
+        //   通过 PDL 与主 combine kernel 流水重叠
+        //   stream_control_before_epilogue: 确保在 epilogue 前同步
         stream_control_before_epilogue(previous_event_before_epilogue);
         launch_combine_reduce_epilogue(combined_x.data_ptr(),
                                        combined_topk_weights_ptr,
